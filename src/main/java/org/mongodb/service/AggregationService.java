@@ -15,7 +15,6 @@ import org.mongodb.model.Aggregation;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.mongodb.core.MongoTemplate;
@@ -28,7 +27,6 @@ import java.util.*;
 import java.util.stream.Collectors;
 
 @Service
-@ConditionalOnMissingBean
 public class AggregationService {
 
         private Logger logger = LoggerFactory.getLogger(getClass());

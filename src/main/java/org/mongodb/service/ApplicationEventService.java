@@ -10,13 +10,11 @@ import org.mongodb.model.ApplicationEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.stereotype.Service;
 
 
 
 @Service
-@ConditionalOnMissingBean
 public class ApplicationEventService<T> {
 	Logger logger = LoggerFactory.getLogger(getClass());
 

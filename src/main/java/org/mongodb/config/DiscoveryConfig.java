@@ -16,8 +16,7 @@ import org.mongodb.service.ChangeStreamService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.data.mongodb.core.MongoTemplate;
 import org.springframework.scheduling.annotation.EnableScheduling;
@@ -38,19 +37,16 @@ import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 
 @Configuration
+@ConditionalOnProperty(prefix = "discovery", name = "enabled", havingValue = "true", matchIfMissing = true)
 @EnableScheduling
-@ConditionalOnMissingBean
 public class DiscoveryConfig {
     Logger logger = LoggerFactory.getLogger(this.getClass());
 
     private static final String INDEX_KEY = "at";
     private static final String INDEX_NAME = "ttl";
 
-    @Value("${settings.instances.collection}")
-    private String collection;
-    @Value("${settings.instances.maxTimeout}")
-    private long maxTimeout;
-
+    @Autowired
+    private DiscoveryProperties discoveryProperties;
     @Autowired
     private MongoTemplate mongoTemplate;
 
@@ -63,19 +59,18 @@ public class DiscoveryConfig {
     @Autowired
     private ApplicationEventService<Document> applicationEventService;
     
-	@Autowired
-	private String podName;
+	private String podName = System.getenv("HOSTNAME");
 
     private void createIndex(MongoCollection<Document> coll) {
         coll.createIndex(Indexes.descending(INDEX_KEY),
-                new IndexOptions().expireAfter(maxTimeout, TimeUnit.MILLISECONDS).name(INDEX_NAME));
+                new IndexOptions().expireAfter(discoveryProperties.getHeartbeat().getMaxTimeout(), TimeUnit.MILLISECONDS).name(INDEX_NAME));
     }
 
     ChangeStream<Document> cs;
 
     @PostConstruct
     private void init() {
-        MongoCollection<Document> coll = mongoTemplate.getCollection(collection);
+        MongoCollection<Document> coll = mongoTemplate.getCollection(discoveryProperties.getCollection());
         try {
             createIndex(coll);
         } catch (MongoCommandException e) {
@@ -87,17 +82,17 @@ public class DiscoveryConfig {
         this.instances.addAll(coll.find().projection(Projections.include("_id")).map(d->d.getString("_id")).into(new ArrayList<>()));
         cs = ChangeStream.of("discovery", Mode.BOARDCAST,
                 List.of(Aggregates.match(Filters.in("operationType", List.of("insert", "update", "delete"))))).fullDocumentBeforeChange(FullDocumentBeforeChange.REQUIRED);
-        changeStreamService.run(ChangeStreamRegistry.<Document>builder().collectionName(collection).body(e -> {
+        changeStreamService.run(ChangeStreamRegistry.<Document>builder().collectionName(discoveryProperties.getCollection()).body(e -> {
             ApplicationEvent<Document> event = ApplicationEvent.<Document>builder().name(e.getOperationType().name()).key(e.getDocumentKey().getString("_id").getValue()).updateDescription(e.getUpdateDescription()).build();
             switch (e.getOperationType()) {
                 case INSERT:
-                    instances.add(event.getKey());
+                    this.instances.add(event.getKey());
                     event.setDocument(e.getFullDocument());
                     break;
                 case UPDATE:
                     break;
                 case DELETE:
-                    instances.remove(event.getKey());
+                    this.instances.remove(event.getKey());
                     event.setDocument(e.getFullDocumentBeforeChange());
                     break;
                 default:
@@ -112,9 +107,9 @@ public class DiscoveryConfig {
             cs.setRunning(false);
     }
 
-    @Scheduled(fixedRateString = "${settings.instances.heartbeat.interval}")
+    @Scheduled(fixedRateString = "#{@discoveryProperties.heartbeat.interval}")
     private void heartbeat() {
-        mongoTemplate.getCollection(collection).updateOne(Filters.eq("_id", podName),
+        mongoTemplate.getCollection(discoveryProperties.getCollection()).updateOne(Filters.eq("_id", podName),
                 Updates.combine(Updates.set("_id", podName), Updates.set(INDEX_KEY, new Date())),
                 new UpdateOptions().upsert(true));
     }

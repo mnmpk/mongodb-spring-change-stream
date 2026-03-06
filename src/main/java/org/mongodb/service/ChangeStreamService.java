@@ -12,8 +12,11 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 
+import org.bson.BsonDocument;
 import org.bson.BsonString;
 import org.bson.Document;
+import org.mongodb.config.ChangeStreamProperties;
+import org.mongodb.config.DiscoveryProperties;
 import org.mongodb.dao.PipelineRepository;
 import org.mongodb.model.Aggregation;
 import org.mongodb.model.ChangeStream;
@@ -24,8 +27,6 @@ import org.mongodb.model.PipelineTemplate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.data.mongodb.core.MongoTemplate;
 import org.springframework.resilience.annotation.Retryable;
 import org.springframework.stereotype.Service;
@@ -44,29 +45,21 @@ import com.mongodb.client.model.Indexes;
 import com.mongodb.client.model.UpdateOptions;
 import com.mongodb.client.model.Updates;
 import com.mongodb.client.model.changestream.OperationType;
+import com.mongodb.client.model.changestream.UpdateDescription;
 import com.mongodb.client.result.UpdateResult;
 
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 
 @Service
-@ConditionalOnMissingBean
 public class ChangeStreamService<T> {
 	Logger logger = LoggerFactory.getLogger(getClass());
 	private static final String INDEX_NAME = "ttl";
-	private static final String RESUME_TOKEN_COLL = "_resumeTokens";
 	private static final String CSID_FIELD = "_id.cs";
 	private static final String HOST_FIELD = "_id.h";
 	private static final String DATE_FIELD = "at";
 	private static final String TOKEN_FIELD = "t";
 	private static final String CHANGE_STREAMS_FIELD = "cs";
-
-	@Value("${settings.changeStream.tokenMaxLifeTime}")
-	private long tokenMaxLifeTime;
-	@Value("${settings.instances.collection}")
-	private String instancesCollectionName;
-    @Value("${settings.instances.maxTimeout}")
-    private long maxTimeout;
 
 	@Autowired
 	private MongoClient mongoClient;
@@ -85,15 +78,21 @@ public class ChangeStreamService<T> {
 	@Autowired
 	private PipelineRepository pipelineRepository;
 
-	@Autowired
-	private String podName;
+	private final String podName = System.getenv("HOSTNAME");
+	
 	@Autowired
 	private Set<String> instances;
 
+    @Autowired
+    private DiscoveryProperties discoveryProperties;
+
+    @Autowired
+    private ChangeStreamProperties changeStreamProperties;
+	
 	@PostConstruct
 	private void init() {
-		mongoTemplate.getCollection(RESUME_TOKEN_COLL).createIndex(Indexes.descending(DATE_FIELD),
-				new IndexOptions().expireAfter(tokenMaxLifeTime, TimeUnit.MILLISECONDS).name(INDEX_NAME));
+		mongoTemplate.getCollection(changeStreamProperties.getResumeTokenCollection()).createIndex(Indexes.descending(DATE_FIELD),
+				new IndexOptions().expireAfter(changeStreamProperties.getTokenMaxLifeTime(), TimeUnit.MILLISECONDS).name(INDEX_NAME));
 
 		logger.info("subscribe on node change");
 		applicationEventService.subscribe(ae -> {
@@ -109,22 +108,35 @@ public class ChangeStreamService<T> {
 						case INSERT:
 							if (Mode.AUTO_SCALE == cs.getMode()) {
 								this._stop(reg);
-								run(reg, ae.getDocument()!=null?((Document)ae.getDocument()).getDate("at"):null);
+								run(reg, ae.getDocument() != null ? ((Document) ae.getDocument()).getDate("at") : null);
+							} else {
+								reg.getInstances().add(ae.getKey());
 							}
 							break;
 						case UPDATE:
 							if (Mode.AUTO_RECOVER == cs.getMode()) {
-								if (ae.getUpdateDescription() != null
-										&& (ae.getUpdateDescription().getRemovedFields().contains(CHANGE_STREAMS_FIELD)
-												|| (ae.getUpdateDescription().getUpdatedFields()
-														.containsKey(CHANGE_STREAMS_FIELD)
-														&& !ae.getUpdateDescription().getUpdatedFields()
-																.getArray(CHANGE_STREAMS_FIELD)
-																.contains(new BsonString(csId))))) {
-									logger.info(
-											"stopping change stream " + csId + ", remove from registry.");
-									this._stop(reg);
-									changeStreams.remove(csId);
+								UpdateDescription ud = ae.getUpdateDescription();
+								if (ud != null) {
+									if (ud.getRemovedFields().contains(CHANGE_STREAMS_FIELD)) {
+										logger.info(
+												"stopping change stream " + csId);
+										this._stop(reg);
+									} else {
+										BsonDocument updatedFields = ud.getUpdatedFields();
+										if (updatedFields != null && updatedFields.containsKey(CHANGE_STREAMS_FIELD)) {
+											if (updatedFields.getArray(CHANGE_STREAMS_FIELD)
+													.contains(new BsonString(csId))) {
+												if (!reg.getChangeStream().isRunning()) {
+													// restart change stream
+													this.run(reg);
+												}
+											} else {
+												logger.info(
+														"stopping change stream " + csId);
+												this._stop(reg);
+											}
+										}
+									}
 								}
 							} else if (Mode.AUTO_SCALE == cs.getMode()) {
 								if (!cs.isRunning()) {
@@ -159,7 +171,9 @@ public class ChangeStreamService<T> {
 								}
 							} else if (Mode.AUTO_SCALE == cs.getMode()) {
 								this._stop(reg);
-								run(reg, ((Document)ae.getDocument()).getDate("at"));
+								run(reg, ((Document) ae.getDocument()).getDate("at"));
+							} else {
+								reg.getInstances().remove(ae.getKey());
 							}
 							break;
 						default:
@@ -185,8 +199,7 @@ public class ChangeStreamService<T> {
 		this.run(reg, null);
 	}
 
-	@Retryable(includes = { MongoException.class }, maxRetries = 10, delay = 5000,
-        multiplier = 2)
+	@Retryable(includes = { MongoException.class }, maxRetries = 10, delay = 5000, multiplier = 2)
 	public void run(ChangeStreamRegistry<T> reg, Date earliest) {
 		logger.info("Start running change stream");
 		changeStreams.put(reg.getChangeStream().getId(), reg);
@@ -197,7 +210,7 @@ public class ChangeStreamService<T> {
 			PipelineTemplate p = this.pipelineRepository.findByName("csScaleToken");
 			if (p == null || p.getContent() == null)
 				throw new RuntimeException("Pipeline not found");
-			Aggregation<Document> agg = Aggregation.of(RESUME_TOKEN_COLL, p.getContent());
+			Aggregation<Document> agg = Aggregation.of(changeStreamProperties.getResumeTokenCollection(), p.getContent());
 			Map<String, Object> variables = new HashMap<>();
 			variables.put("earliest", earliest);
 			List<Document> l = aggregationService.execute(agg, variables);
@@ -213,14 +226,14 @@ public class ChangeStreamService<T> {
 				clientSession.withTransaction(new TransactionBody<Void>() {
 					@Override
 					public Void execute() {
-						Document doc = mongoTemplate.getCollection(instancesCollectionName)
+						Document doc = mongoTemplate.getCollection(discoveryProperties.getCollection())
 								.find(clientSession, Filters.eq(CHANGE_STREAMS_FIELD, cs.getId())).first();
 						if (doc == null) {
-							UpdateResult ur = mongoTemplate.getCollection(instancesCollectionName).updateOne(
+							UpdateResult ur = mongoTemplate.getCollection(discoveryProperties.getCollection()).updateOne(
 									clientSession,
 									Filters.eq("_id", podName),
 									Updates.combine(Updates.set("_id", podName),
-									Updates.set(DATE_FIELD, Instant.now().plus(maxTimeout, ChronoUnit.MILLIS)),
+											Updates.set(DATE_FIELD, Instant.now().plus(discoveryProperties.getHeartbeat().getMaxTimeout(), ChronoUnit.MILLIS)),
 											Updates.addToSet(CHANGE_STREAMS_FIELD, cs.getId())),
 									new UpdateOptions().upsert(true));
 							logger.info("Update result:" + ur);
@@ -229,6 +242,7 @@ public class ChangeStreamService<T> {
 								start(reg);
 							}
 						} else {
+							reg.getInstances().add(doc.getString("_id"));
 							if (podName.equals(doc.getString("_id"))) {
 								if (changeStreams.containsKey(cs.getId())
 										&& cs.isRunning()) {
@@ -244,7 +258,8 @@ public class ChangeStreamService<T> {
 					}
 
 				}, TransactionOptions.builder()
-						.writeConcern(WriteConcern.MAJORITY).readConcern(ReadConcern.MAJORITY).readPreference(ReadPreference.primary())
+						.writeConcern(WriteConcern.MAJORITY).readConcern(ReadConcern.MAJORITY)
+						.readPreference(ReadPreference.primary())
 						.build());
 			} catch (RuntimeException e) {
 				logger.error("Unexpected error while registering change stream " + cs.getId() + ":", e);
@@ -276,25 +291,28 @@ public class ChangeStreamService<T> {
 				logger.error("Stopping change stream '" + reg.getChangeStream().getId() + "'' due to unexpected error:",
 						e);
 				this._stop(reg);
-				//Recover for unexpected exception
+				// Recover for unexpected exception
 				this.run(reg);
 			}
 			return null;
 		}, taskExecutor);
 		reg.setCompletableFuture(completableFuture);
+		reg.getInstances().add(podName);
+		logger.info(reg.getInstances() + " are running change stream " + reg.getChangeStream().getId());
 		logger.info("Change stream " + reg.getChangeStream().getId() + " started");
 	}
 
 	public void stop(ChangeStreamRegistry<T> reg) {
 		logger.info("Stop running change stream");
 		this._stop(reg);
-		mongoTemplate.getCollection(instancesCollectionName).findOneAndUpdate(
+		mongoTemplate.getCollection(discoveryProperties.getCollection()).findOneAndUpdate(
 				Filters.eq(CHANGE_STREAMS_FIELD, reg.getChangeStream().getId()),
 				Updates.pull(CHANGE_STREAMS_FIELD, podName));
 	}
 
 	public void _stop(ChangeStreamRegistry<T> reg) {
 		reg.getChangeStream().setRunning(false);
+		reg.getInstances().remove(podName);
 		if (reg.getCompletableFuture() != null)
 			reg.getCompletableFuture().join();
 	}
@@ -304,6 +322,8 @@ public class ChangeStreamService<T> {
 		int index = new ArrayList<String>(this.instances).indexOf(podName);
 		reg.setInstanceSize(instances.size());
 		reg.setInstanceIndex(index);
+		reg.getInstances().clear();
+		reg.getInstances().addAll(instances);
 		if (instances.size() > 0 && index >= 0) {
 			if (cs.isRunning()) {
 				this._stop(reg);
@@ -317,11 +337,10 @@ public class ChangeStreamService<T> {
 		}
 	}
 
-	@Retryable(includes = { MongoException.class }, maxRetries = 10, delay = 1000,
-        multiplier = 2)
+	@Retryable(includes = { MongoException.class }, maxRetries = 10, delay = 1000, multiplier = 2)
 	private void saveCheckpoint(String csId, BsonString token) {
 		logger.info("save checkpoint");
-		mongoTemplate.getCollection(RESUME_TOKEN_COLL).updateOne(
+		mongoTemplate.getCollection(changeStreamProperties.getResumeTokenCollection()).updateOne(
 				Filters.and(Filters.eq(CSID_FIELD, csId), Filters.eq(HOST_FIELD, podName)),
 				Updates.combine(Updates.set(CSID_FIELD, csId),
 						Updates.combine(Updates.set(HOST_FIELD, podName),
