@@ -18,7 +18,7 @@ import com.mzinx.mongodb.changestream.model.ChangeStreamRegistry;
 @AutoConfiguration
 @EnableConfigurationProperties(ChangeStreamProperties.class)
 @ConditionalOnProperty(prefix = "change-stream", name = "enabled", havingValue = "true", matchIfMissing = true)
-@ComponentScan("com.mzinx.changestream")
+@ComponentScan("com.mzinx.mongodb.changestream")
 @Import(ScanRegistrar.class)
 public class ChangeStreamAutoConfig {
 

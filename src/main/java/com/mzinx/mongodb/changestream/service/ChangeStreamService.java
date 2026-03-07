@@ -5,12 +5,14 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 import org.bson.BsonDocument;
 import org.bson.BsonString;
@@ -18,6 +20,7 @@ import org.bson.Document;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.ApplicationEvent;
 import org.springframework.data.mongodb.core.MongoTemplate;
 import org.springframework.resilience.annotation.Retryable;
 import org.springframework.stereotype.Service;
@@ -35,6 +38,7 @@ import com.mongodb.client.model.IndexOptions;
 import com.mongodb.client.model.Indexes;
 import com.mongodb.client.model.UpdateOptions;
 import com.mongodb.client.model.Updates;
+import com.mongodb.client.model.changestream.ChangeStreamDocument;
 import com.mongodb.client.model.changestream.OperationType;
 import com.mongodb.client.model.changestream.UpdateDescription;
 import com.mongodb.client.result.UpdateResult;
@@ -72,120 +76,128 @@ public class ChangeStreamService<T> {
 	private Map<String, ChangeStreamRegistry<T>> changeStreams;
 
 	@Autowired
-	private ApplicationEventService<Document> applicationEventService;
-	@Autowired
 	private AggregationService aggregationService;
 	@Autowired
 	private PipelineRepository pipelineRepository;
 
 	private final String podName = System.getenv("HOSTNAME");
-	
+
 	@Autowired
 	private Set<String> instances;
 
-    @Autowired
-    private ChangeStreamProperties changeStreamProperties;
-	
+	@Autowired
+	private ChangeStreamProperties changeStreamProperties;
+
+	private static final Set<Consumer<ChangeStreamDocument<?>>> listeners = new HashSet<>();
+
 	@PostConstruct
 	private void init() {
-		mongoTemplate.getCollection(changeStreamProperties.getResumeTokenCollection()).createIndex(Indexes.descending(DATE_FIELD),
-				new IndexOptions().expireAfter(changeStreamProperties.getTokenMaxLifeTime(), TimeUnit.MILLISECONDS).name(INDEX_NAME));
-
-		logger.info("subscribe on node change");
-		applicationEventService.subscribe(ae -> {
-			try {
-				if (OperationType.INSERT == OperationType.valueOf(ae.getName())
-						|| OperationType.DELETE == OperationType.valueOf(ae.getName())) {
-					logger.info("change streams running in this node " + changeStreams.keySet());
-				}
-				for (String csId : changeStreams.keySet()) {
-					ChangeStreamRegistry<T> reg = changeStreams.get(csId);
-					ChangeStream<T> cs = reg.getChangeStream();
-					switch (OperationType.valueOf(ae.getName())) {
-						case INSERT:
-							if (Mode.AUTO_SCALE == cs.getMode()) {
-								this._stop(reg);
-								run(reg, ae.getDocument() != null ? ((Document) ae.getDocument()).getDate("at") : null);
-							} else {
-								reg.getInstances().add(ae.getKey());
-							}
-							break;
-						case UPDATE:
-							if (Mode.AUTO_RECOVER == cs.getMode()) {
-								UpdateDescription ud = ae.getUpdateDescription();
-								if (ud != null) {
-									if (ud.getRemovedFields().contains(CHANGE_STREAMS_FIELD)) {
-										logger.info(
-												"stopping change stream " + csId);
-										this._stop(reg);
-									} else {
-										BsonDocument updatedFields = ud.getUpdatedFields();
-										if (updatedFields != null && updatedFields.containsKey(CHANGE_STREAMS_FIELD)) {
-											if (updatedFields.getArray(CHANGE_STREAMS_FIELD)
-													.contains(new BsonString(csId))) {
-												if (!reg.getChangeStream().isRunning()) {
-													// restart change stream
-													this.run(reg);
+		mongoTemplate.getCollection(changeStreamProperties.getResumeTokenCollection())
+				.createIndex(Indexes.descending(DATE_FIELD),
+						new IndexOptions()
+								.expireAfter(changeStreamProperties.getTokenMaxLifeTime(), TimeUnit.MILLISECONDS)
+								.name(INDEX_NAME));
+		this.subscribe(event -> {
+			if (event.getNamespace().getCollectionName().equals(changeStreamProperties.getInstanceCollection())) {
+				try {
+					if (OperationType.INSERT == event.getOperationType()
+							|| OperationType.DELETE == event.getOperationType()) {
+						logger.info("change streams running in this node " + changeStreams.keySet());
+					}
+					String instance = event.getDocumentKey().getString("_id").getValue();
+					for (String csId : changeStreams.keySet()) {
+						ChangeStreamRegistry<T> reg = changeStreams.get(csId);
+						ChangeStream<T> cs = reg.getChangeStream();
+						switch (event.getOperationType()) {
+							case INSERT:
+								if (Mode.AUTO_SCALE == cs.getMode()) {
+									this._stop(reg);
+									run(reg, event.getFullDocument() != null
+											? ((Document) event.getFullDocument()).getDate("at")
+											: null);
+								} else {
+									reg.getInstances().add(instance);
+								}
+								break;
+							case UPDATE:
+								if (Mode.AUTO_RECOVER == cs.getMode()) {
+									UpdateDescription ud = event.getUpdateDescription();
+									if (ud != null) {
+										if (ud.getRemovedFields().contains(CHANGE_STREAMS_FIELD)) {
+											logger.info(
+													"stopping change stream " + csId);
+											this._stop(reg);
+										} else {
+											BsonDocument updatedFields = ud.getUpdatedFields();
+											if (updatedFields != null
+													&& updatedFields.containsKey(CHANGE_STREAMS_FIELD)) {
+												if (updatedFields.getArray(CHANGE_STREAMS_FIELD)
+														.contains(new BsonString(csId))) {
+													if (!reg.getChangeStream().isRunning()) {
+														// restart change stream
+														this.run(reg);
+													}
+												} else {
+													logger.info(
+															"stopping change stream " + csId);
+													this._stop(reg);
 												}
-											} else {
-												logger.info(
-														"stopping change stream " + csId);
-												this._stop(reg);
 											}
 										}
 									}
-								}
-							} else if (Mode.AUTO_SCALE == cs.getMode()) {
-								if (!cs.isRunning()) {
-									logger.info(cs.getId() + " is not yet running in " + podName + " start it now.");
-									scale(reg);
-								}
-							}
-							break;
-						case DELETE:
-							if (Mode.AUTO_RECOVER == cs.getMode()) {
-								if (podName.equals(ae.getKey())) {
-									if (changeStreams.containsKey(cs.getId())
-											&& cs.isRunning()) {
+								} else if (Mode.AUTO_SCALE == cs.getMode()) {
+									if (!cs.isRunning()) {
 										logger.info(
-												"Change stream running in this node should stop.");
-										this._stop(reg);
+												cs.getId() + " is not yet running in " + podName + " start it now.");
+										scale(reg);
 									}
-								} else {
-									if (changeStreams.containsKey(cs.getId())
-											&& changeStreams.get(cs.getId()).getChangeStream().isRunning()) {
-										logger.info(
-												ae.getKey() + " is dead, I'm still running change stream:"
-														+ cs.getId());
+								}
+								break;
+							case DELETE:
+								if (Mode.AUTO_RECOVER == cs.getMode()) {
+									if (podName.equals(instance)) {
+										if (changeStreams.containsKey(cs.getId())
+												&& cs.isRunning()) {
+											logger.info(
+													"Change stream running in this node should stop.");
+											this._stop(reg);
+										}
 									} else {
-										logger.info(
-												ae.getKey() + " is dead, " + podName
-														+ " try to take over change stream:"
-														+ cs.getId());
-										this._stop(reg);
-										run(reg);
+										if (changeStreams.containsKey(cs.getId())
+												&& changeStreams.get(cs.getId()).getChangeStream().isRunning()) {
+											logger.info(
+													instance + " is dead, I'm still running change stream:"
+															+ cs.getId());
+										} else {
+											logger.info(
+													instance + " is dead, " + podName
+															+ " try to take over change stream:"
+															+ cs.getId());
+											this._stop(reg);
+											run(reg);
+										}
 									}
+								} else if (Mode.AUTO_SCALE == cs.getMode()) {
+									this._stop(reg);
+									run(reg, ((Document) event.getFullDocumentBeforeChange()).getDate("at"));
+								} else {
+									reg.getInstances().remove(instance);
 								}
-							} else if (Mode.AUTO_SCALE == cs.getMode()) {
-								this._stop(reg);
-								run(reg, ((Document) ae.getDocument()).getDate("at"));
-							} else {
-								reg.getInstances().remove(ae.getKey());
-							}
-							break;
-						default:
-							break;
+								break;
+							default:
+								break;
+						}
 					}
+				} catch (RuntimeException e) {
+					logger.error("Unexpected error while processing node changes:", e);
 				}
-			} catch (RuntimeException e) {
-				logger.error("Unexpected error while processing node changes:", e);
 			}
 		});
 	}
 
 	@PreDestroy
 	private void destroy() {
-		applicationEventService.clear();
+		this.clear();
 		for (String csId : changeStreams.keySet()) {
 			changeStreams.get(csId).getChangeStream().setRunning(false);
 			changeStreams.remove(csId);
@@ -207,7 +219,8 @@ public class ChangeStreamService<T> {
 			PipelineTemplate p = this.pipelineRepository.findByName("csScaleToken");
 			if (p == null || p.getContent() == null)
 				throw new RuntimeException("Pipeline not found");
-			Aggregation<Document> agg = Aggregation.of(changeStreamProperties.getResumeTokenCollection(), p.getContent());
+			Aggregation<Document> agg = Aggregation.of(changeStreamProperties.getResumeTokenCollection(),
+					p.getContent());
 			Map<String, Object> variables = new HashMap<>();
 			variables.put("earliest", earliest);
 			List<Document> l = aggregationService.execute(agg, variables);
@@ -226,13 +239,16 @@ public class ChangeStreamService<T> {
 						Document doc = mongoTemplate.getCollection(changeStreamProperties.getInstanceCollection())
 								.find(clientSession, Filters.eq(CHANGE_STREAMS_FIELD, cs.getId())).first();
 						if (doc == null) {
-							UpdateResult ur = mongoTemplate.getCollection(changeStreamProperties.getInstanceCollection()).updateOne(
-									clientSession,
-									Filters.eq("_id", podName),
-									Updates.combine(Updates.set("_id", podName),
-											Updates.set(DATE_FIELD, Instant.now().plus(changeStreamProperties.getMaxTimeout(), ChronoUnit.MILLIS)),
-											Updates.addToSet(CHANGE_STREAMS_FIELD, cs.getId())),
-									new UpdateOptions().upsert(true));
+							UpdateResult ur = mongoTemplate
+									.getCollection(changeStreamProperties.getInstanceCollection()).updateOne(
+											clientSession,
+											Filters.eq("_id", podName),
+											Updates.combine(Updates.set("_id", podName),
+													Updates.set(DATE_FIELD,
+															Instant.now().plus(changeStreamProperties.getMaxTimeout(),
+																	ChronoUnit.MILLIS)),
+													Updates.addToSet(CHANGE_STREAMS_FIELD, cs.getId())),
+											new UpdateOptions().upsert(true));
 							logger.info("Update result:" + ur);
 							if (ur.getUpsertedId() != null || ur.getModifiedCount() > 0) {
 								logger.info(podName + " wins");
@@ -346,4 +362,30 @@ public class ChangeStreamService<T> {
 				new UpdateOptions().upsert(true));
 	}
 
+	public void publish(ChangeStreamDocument<T> event) {
+		logger.debug("new event:" + event);
+		listeners.forEach(l -> {
+			CompletableFuture.supplyAsync(() -> {
+				try {
+					l.accept(event);
+				} catch (RuntimeException e) {
+					logger.error("Unexpected error publishing event:", e);
+				}
+				return null;
+			}, taskExecutor);
+		});
+	}
+
+	public void subscribe(Consumer<ChangeStreamDocument<?>> listener) {
+		logger.info("new subscription:" + listeners.add(listener));
+	}
+
+	public void unsubscribe(Consumer<ChangeStreamDocument<T>> listener) {
+		logger.info("remove subscription:" + listeners.remove(listener));
+	}
+
+	public void clear() {
+		logger.info("Clear all subscription");
+		listeners.clear();
+	}
 }
