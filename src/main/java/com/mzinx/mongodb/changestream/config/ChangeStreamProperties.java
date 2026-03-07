@@ -10,6 +10,7 @@ import lombok.Data;
 @Component
 public class ChangeStreamProperties {
     private boolean enabled = true;
+    private String hostname = System.getenv().getOrDefault("HOSTNAME", "localhost");
     private long batchSize = 1000;
     private long maxAwaitTime = 800; // ms
     private long tokenMaxLifeTime = 86400000; // ms

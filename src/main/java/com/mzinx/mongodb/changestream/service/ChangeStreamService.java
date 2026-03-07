@@ -3,6 +3,7 @@ package com.mzinx.mongodb.changestream.service;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -13,14 +14,15 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.stream.Collectors;
 
 import org.bson.BsonDocument;
 import org.bson.BsonString;
 import org.bson.Document;
+import org.bson.conversions.Bson;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.context.ApplicationEvent;
 import org.springframework.data.mongodb.core.MongoTemplate;
 import org.springframework.resilience.annotation.Retryable;
 import org.springframework.stereotype.Service;
@@ -33,9 +35,13 @@ import com.mongodb.WriteConcern;
 import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.TransactionBody;
+import com.mongodb.client.model.Accumulators;
+import com.mongodb.client.model.Aggregates;
 import com.mongodb.client.model.Filters;
 import com.mongodb.client.model.IndexOptions;
 import com.mongodb.client.model.Indexes;
+import com.mongodb.client.model.Projections;
+import com.mongodb.client.model.Sorts;
 import com.mongodb.client.model.UpdateOptions;
 import com.mongodb.client.model.Updates;
 import com.mongodb.client.model.changestream.ChangeStreamDocument;
@@ -80,8 +86,6 @@ public class ChangeStreamService<T> {
 	@Autowired
 	private PipelineRepository pipelineRepository;
 
-	private final String podName = System.getenv("HOSTNAME");
-
 	@Autowired
 	private Set<String> instances;
 
@@ -90,6 +94,9 @@ public class ChangeStreamService<T> {
 
 	private static final Set<Consumer<ChangeStreamDocument<?>>> listeners = new HashSet<>();
 
+	private static final String RESUME_TOKEN_PIPELINE_NAME = "getResumeToken";
+	private PipelineTemplate pipelineTemplate;
+
 	@PostConstruct
 	private void init() {
 		mongoTemplate.getCollection(changeStreamProperties.getResumeTokenCollection())
@@ -97,6 +104,33 @@ public class ChangeStreamService<T> {
 						new IndexOptions()
 								.expireAfter(changeStreamProperties.getTokenMaxLifeTime(), TimeUnit.MILLISECONDS)
 								.name(INDEX_NAME));
+
+		this.pipelineTemplate = this.pipelineRepository.findByName(RESUME_TOKEN_PIPELINE_NAME);
+		if (this.pipelineTemplate == null || this.pipelineTemplate.getContent() == null) {
+			PipelineTemplate p = new PipelineTemplate();
+			p.setName(RESUME_TOKEN_PIPELINE_NAME);
+			List<Bson> ps = List.of(
+					Aggregates.match(
+							Filters.expr(
+									Filters.and(
+											new Document("$eq", Arrays.asList("$_id.cs",
+													new Document("_ph", "csId"))),
+											new Document("$gte", Arrays.asList("$at",
+													new Document("$ifNull",
+															Arrays.asList(new Document("_ph", "earliest"), "$at"))))))),
+					Aggregates.group("$_id.h", Accumulators.first("d", "$$ROOT")),
+					Aggregates.sort(Sorts.ascending("d.at")),
+					Aggregates.limit(1),
+					Aggregates.project(Projections.fields(
+							Projections.computed("_id", "$d._id"),
+							Projections.computed("h", "$d.h"),
+							Projections.computed("at", "$d.at"),
+							Projections.computed("t", "$d.t"))));
+			p.setContent(ps.stream().map(a -> a.toBsonDocument()).collect(Collectors.toList()));
+			p.setAggs(p.getContent().stream().map(d -> new Document(d)).collect(Collectors.toList()));
+			this.pipelineTemplate = this.pipelineRepository.save(p);
+		}
+
 		this.subscribe(event -> {
 			if (event.getNamespace().getCollectionName().equals(changeStreamProperties.getInstanceCollection())) {
 				try {
@@ -148,14 +182,15 @@ public class ChangeStreamService<T> {
 								} else if (Mode.AUTO_SCALE == cs.getMode()) {
 									if (!cs.isRunning()) {
 										logger.info(
-												cs.getId() + " is not yet running in " + podName + " start it now.");
+												cs.getId() + " is not yet running in "
+														+ changeStreamProperties.getHostname() + " start it now.");
 										scale(reg);
 									}
 								}
 								break;
 							case DELETE:
 								if (Mode.AUTO_RECOVER == cs.getMode()) {
-									if (podName.equals(instance)) {
+									if (changeStreamProperties.getHostname().equals(instance)) {
 										if (changeStreams.containsKey(cs.getId())
 												&& cs.isRunning()) {
 											logger.info(
@@ -170,7 +205,7 @@ public class ChangeStreamService<T> {
 															+ cs.getId());
 										} else {
 											logger.info(
-													instance + " is dead, " + podName
+													instance + " is dead, " + changeStreamProperties.getHostname()
 															+ " try to take over change stream:"
 															+ cs.getId());
 											this._stop(reg);
@@ -216,12 +251,10 @@ public class ChangeStreamService<T> {
 
 		logger.info("ResumeStrategy:" + cs.getResumeStrategy());
 		if (ResumeStrategy.NONE != cs.getResumeStrategy()) {
-			PipelineTemplate p = this.pipelineRepository.findByName("csScaleToken");
-			if (p == null || p.getContent() == null)
-				throw new RuntimeException("Pipeline not found");
 			Aggregation<Document> agg = Aggregation.of(changeStreamProperties.getResumeTokenCollection(),
-					p.getContent());
+					this.pipelineTemplate.getContent());
 			Map<String, Object> variables = new HashMap<>();
+			variables.put("csId", cs.getId());
 			variables.put("earliest", earliest);
 			List<Document> l = aggregationService.execute(agg, variables);
 			if (l.size() > 0) {
@@ -242,8 +275,8 @@ public class ChangeStreamService<T> {
 							UpdateResult ur = mongoTemplate
 									.getCollection(changeStreamProperties.getInstanceCollection()).updateOne(
 											clientSession,
-											Filters.eq("_id", podName),
-											Updates.combine(Updates.set("_id", podName),
+											Filters.eq("_id", changeStreamProperties.getHostname()),
+											Updates.combine(Updates.set("_id", changeStreamProperties.getHostname()),
 													Updates.set(DATE_FIELD,
 															Instant.now().plus(changeStreamProperties.getMaxTimeout(),
 																	ChronoUnit.MILLIS)),
@@ -251,12 +284,12 @@ public class ChangeStreamService<T> {
 											new UpdateOptions().upsert(true));
 							logger.info("Update result:" + ur);
 							if (ur.getUpsertedId() != null || ur.getModifiedCount() > 0) {
-								logger.info(podName + " wins");
+								logger.info(changeStreamProperties.getHostname() + " wins");
 								start(reg);
 							}
 						} else {
 							reg.getInstances().add(doc.getString("_id"));
-							if (podName.equals(doc.getString("_id"))) {
+							if (changeStreamProperties.getHostname().equals(doc.getString("_id"))) {
 								if (changeStreams.containsKey(cs.getId())
 										&& cs.isRunning()) {
 									logger.info("Change stream already running");
@@ -310,7 +343,7 @@ public class ChangeStreamService<T> {
 			return null;
 		}, taskExecutor);
 		reg.setCompletableFuture(completableFuture);
-		reg.getInstances().add(podName);
+		reg.getInstances().add(changeStreamProperties.getHostname());
 		logger.info(reg.getInstances() + " are running change stream " + reg.getChangeStream().getId());
 		logger.info("Change stream " + reg.getChangeStream().getId() + " started");
 	}
@@ -320,19 +353,19 @@ public class ChangeStreamService<T> {
 		this._stop(reg);
 		mongoTemplate.getCollection(changeStreamProperties.getInstanceCollection()).findOneAndUpdate(
 				Filters.eq(CHANGE_STREAMS_FIELD, reg.getChangeStream().getId()),
-				Updates.pull(CHANGE_STREAMS_FIELD, podName));
+				Updates.pull(CHANGE_STREAMS_FIELD, changeStreamProperties.getHostname()));
 	}
 
 	public void _stop(ChangeStreamRegistry<T> reg) {
 		reg.getChangeStream().setRunning(false);
-		reg.getInstances().remove(podName);
+		reg.getInstances().remove(changeStreamProperties.getHostname());
 		if (reg.getCompletableFuture() != null)
 			reg.getCompletableFuture().join();
 	}
 
 	private void scale(ChangeStreamRegistry<T> reg) {
 		ChangeStream<T> cs = reg.getChangeStream();
-		int index = new ArrayList<String>(this.instances).indexOf(podName);
+		int index = new ArrayList<String>(this.instances).indexOf(changeStreamProperties.getHostname());
 		reg.setInstanceSize(this.instances.size());
 		reg.setInstanceIndex(index);
 		reg.getInstances().clear();
@@ -343,10 +376,11 @@ public class ChangeStreamService<T> {
 			}
 			logger.info("change stream " + (index + 1) + " of " + this.instances.size()
 					+ " start running in "
-					+ podName);
+					+ changeStreamProperties.getHostname());
 			start(reg);
 		} else {
-			logger.info("Node " + podName + " is not ready to run change stream:" + cs.getId());
+			logger.info("Node " + changeStreamProperties.getHostname() + " is not ready to run change stream:"
+					+ cs.getId());
 		}
 	}
 
@@ -354,9 +388,9 @@ public class ChangeStreamService<T> {
 	private void saveCheckpoint(String csId, BsonString token) {
 		logger.info("save checkpoint");
 		mongoTemplate.getCollection(changeStreamProperties.getResumeTokenCollection()).updateOne(
-				Filters.and(Filters.eq(CSID_FIELD, csId), Filters.eq(HOST_FIELD, podName)),
+				Filters.and(Filters.eq(CSID_FIELD, csId), Filters.eq(HOST_FIELD, changeStreamProperties.getHostname())),
 				Updates.combine(Updates.set(CSID_FIELD, csId),
-						Updates.combine(Updates.set(HOST_FIELD, podName),
+						Updates.combine(Updates.set(HOST_FIELD, changeStreamProperties.getHostname()),
 								Updates.set(DATE_FIELD, new Date()),
 								Updates.set(TOKEN_FIELD, token))),
 				new UpdateOptions().upsert(true));
