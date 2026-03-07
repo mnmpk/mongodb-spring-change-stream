@@ -1,4 +1,4 @@
-package org.mongodb.service;
+package com.mzinx.mongodb.changestream.service;
 
 import java.util.HashSet;
 import java.util.Set;
@@ -6,11 +6,12 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.function.Consumer;
 
-import org.mongodb.model.ApplicationEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+
+import com.mzinx.mongodb.changestream.model.ApplicationEvent;
 
 
 

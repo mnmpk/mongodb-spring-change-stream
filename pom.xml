@@ -8,26 +8,48 @@
 		<version>4.0.0</version>
 		<relativePath/>
 	</parent>
-	<groupId>org.mongodb</groupId>
+
+	<groupId>com.mzinx</groupId>
 	<artifactId>mongodb-spring-change-stream</artifactId>
-	<version>0.0.1-SNAPSHOT</version>
+	<version>0.0.1</version>
+    <packaging>jar</packaging>
+
 	<name>mongodb-spring-change-stream</name>
-	<description>Demo project for Spring Boot</description>
+	<description>MongoDB Change stream Spring extension</description>
+	<url>https://github.com/mzinx/mongodb-spring-change-stream</url>
+	
+    <licenses>
+        <license>
+            <name>Apache License, Version 2.0</name>
+            <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+    <developers>
+        <developer>
+            <id>mnmpkm</id>
+            <name>M Ma</name>
+            <email>m_ma@mzinx.com</email>
+            <organization>MzinX Ltd.</organization>
+            <organizationUrl>https://mzinx.com</organizationUrl>
+        </developer>
+    </developers>
+    <scm>
+        <connection>scm:git:git://github.com/mzinx/mongodb-spring-change-stream.git</connection>
+        <developerConnection>scm:git:ssh://github.com:mzinx/mongodb-spring-change-stream.git</developerConnection>
+        <url>https://github.com/mzinx/mongodb-spring-change-stream/tree/main</url>
+        <tag>HEAD</tag>
+    </scm>
 	<dependencies>
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot</artifactId>
 		</dependency>
-
-		<dependency>
-			<groupId>org.springframework.boot</groupId>
-			<artifactId>spring-boot-starter-data-mongodb</artifactId>
-		</dependency>
 		
 		<dependency>
-			<groupId>org.mongodb</groupId>
+			<groupId>com.mzinx</groupId>
 			<artifactId>mongodb-spring-aggregation</artifactId>
-			<version>0.0.1-SNAPSHOT</version>
+			<version>0.0.1</version>
 		</dependency>
 		<dependency>
 			<groupId>org.projectlombok</groupId>
@@ -52,6 +74,79 @@
 	</dependencies>
 	<build>
 		<plugins>
+			<!-- Central Publishing Plugin -->
+            <plugin>
+                <groupId>org.sonatype.central</groupId>
+                <artifactId>central-publishing-maven-plugin</artifactId>
+                <version>0.9.0</version>
+                <extensions>true</extensions>
+                <configuration>
+                    <publishingServerId>central</publishingServerId>
+                    <autoPublish>true</autoPublish>
+                    <waitUntil>published</waitUntil>
+                </configuration>
+            </plugin>
+			<!-- GPG Signing Plugin -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-gpg-plugin</artifactId>
+                <version>3.1.0</version>
+                <executions>
+                    <execution>
+                        <id>sign-artifacts</id>
+                        <phase>verify</phase>
+                        <goals>
+                            <goal>sign</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <!-- Retrieves passphrase from settings.xml -->
+                    <passphraseServerId>gpg.passphrase</passphraseServerId>
+                    <!-- Required for gpg2 to avoid GUI prompts -->
+                    <gpgArguments>
+                        <arg>--pinentry-mode</arg>
+                        <arg>loopback</arg>
+                    </gpgArguments>
+                    <!-- Ensure correct GPG binary is used -->
+                    <executable>gpg</executable>
+                </configuration>
+            </plugin>
+			<!-- Source Attachment Plugin -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-source-plugin</artifactId>
+                <version>3.3.1</version>
+                <executions>
+                    <execution>
+                        <id>attach-sources</id>
+                        <goals>
+                            <goal>jar-no-fork</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <!-- Javadoc Generation Plugin -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-javadoc-plugin</artifactId>
+                <version>3.6.3</version>
+                <executions>
+                    <execution>
+                        <id>attach-javadocs</id>
+                        <goals>
+                            <goal>jar</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <!-- Optional: Configure Javadoc strictness -->
+                    <doclint>none</doclint>
+                    <quiet>true</quiet>
+                </configuration>
+            </plugin>
+			
 			<plugin>
 				<groupId>org.apache.maven.plugins</groupId>
 				<artifactId>maven-compiler-plugin</artifactId>

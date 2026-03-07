@@ -1,4 +1,4 @@
-package org.mongodb.model;
+package com.mzinx.mongodb.changestream.model;
 
 import com.mongodb.client.model.changestream.UpdateDescription;
 

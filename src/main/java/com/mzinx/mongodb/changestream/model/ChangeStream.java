@@ -1,4 +1,4 @@
-package org.mongodb.model;
+package com.mzinx.mongodb.changestream.model;
 
 import java.util.ArrayList;
 import java.util.Arrays;

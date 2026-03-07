@@ -1,4 +1,4 @@
-package org.mongodb.service;
+package com.mzinx.mongodb.changestream.service;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
@@ -15,15 +15,6 @@ import java.util.concurrent.TimeUnit;
 import org.bson.BsonDocument;
 import org.bson.BsonString;
 import org.bson.Document;
-import org.mongodb.config.ChangeStreamProperties;
-import org.mongodb.config.DiscoveryProperties;
-import org.mongodb.dao.PipelineRepository;
-import org.mongodb.model.Aggregation;
-import org.mongodb.model.ChangeStream;
-import org.mongodb.model.ChangeStream.Mode;
-import org.mongodb.model.ChangeStream.ResumeStrategy;
-import org.mongodb.model.ChangeStreamRegistry;
-import org.mongodb.model.PipelineTemplate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -47,6 +38,15 @@ import com.mongodb.client.model.Updates;
 import com.mongodb.client.model.changestream.OperationType;
 import com.mongodb.client.model.changestream.UpdateDescription;
 import com.mongodb.client.result.UpdateResult;
+import com.mzinx.mongodb.aggregation.service.AggregationService;
+import com.mzinx.mongodb.changestream.config.ChangeStreamProperties;
+import com.mzinx.mongodb.changestream.model.ChangeStream;
+import com.mzinx.mongodb.changestream.model.ChangeStreamRegistry;
+import com.mzinx.mongodb.changestream.model.ChangeStream.Mode;
+import com.mzinx.mongodb.changestream.model.ChangeStream.ResumeStrategy;
+import com.mzinx.mongodb.aggregation.dao.PipelineRepository;
+import com.mzinx.mongodb.aggregation.model.Aggregation;
+import com.mzinx.mongodb.aggregation.model.PipelineTemplate;
 
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -82,9 +82,6 @@ public class ChangeStreamService<T> {
 	
 	@Autowired
 	private Set<String> instances;
-
-    @Autowired
-    private DiscoveryProperties discoveryProperties;
 
     @Autowired
     private ChangeStreamProperties changeStreamProperties;
@@ -226,14 +223,14 @@ public class ChangeStreamService<T> {
 				clientSession.withTransaction(new TransactionBody<Void>() {
 					@Override
 					public Void execute() {
-						Document doc = mongoTemplate.getCollection(discoveryProperties.getCollection())
+						Document doc = mongoTemplate.getCollection(changeStreamProperties.getInstanceCollection())
 								.find(clientSession, Filters.eq(CHANGE_STREAMS_FIELD, cs.getId())).first();
 						if (doc == null) {
-							UpdateResult ur = mongoTemplate.getCollection(discoveryProperties.getCollection()).updateOne(
+							UpdateResult ur = mongoTemplate.getCollection(changeStreamProperties.getInstanceCollection()).updateOne(
 									clientSession,
 									Filters.eq("_id", podName),
 									Updates.combine(Updates.set("_id", podName),
-											Updates.set(DATE_FIELD, Instant.now().plus(discoveryProperties.getHeartbeat().getMaxTimeout(), ChronoUnit.MILLIS)),
+											Updates.set(DATE_FIELD, Instant.now().plus(changeStreamProperties.getMaxTimeout(), ChronoUnit.MILLIS)),
 											Updates.addToSet(CHANGE_STREAMS_FIELD, cs.getId())),
 									new UpdateOptions().upsert(true));
 							logger.info("Update result:" + ur);
@@ -305,7 +302,7 @@ public class ChangeStreamService<T> {
 	public void stop(ChangeStreamRegistry<T> reg) {
 		logger.info("Stop running change stream");
 		this._stop(reg);
-		mongoTemplate.getCollection(discoveryProperties.getCollection()).findOneAndUpdate(
+		mongoTemplate.getCollection(changeStreamProperties.getInstanceCollection()).findOneAndUpdate(
 				Filters.eq(CHANGE_STREAMS_FIELD, reg.getChangeStream().getId()),
 				Updates.pull(CHANGE_STREAMS_FIELD, podName));
 	}
@@ -320,11 +317,11 @@ public class ChangeStreamService<T> {
 	private void scale(ChangeStreamRegistry<T> reg) {
 		ChangeStream<T> cs = reg.getChangeStream();
 		int index = new ArrayList<String>(this.instances).indexOf(podName);
-		reg.setInstanceSize(instances.size());
+		reg.setInstanceSize(this.instances.size());
 		reg.setInstanceIndex(index);
 		reg.getInstances().clear();
-		reg.getInstances().addAll(instances);
-		if (instances.size() > 0 && index >= 0) {
+		reg.getInstances().addAll(this.instances);
+		if (this.instances.size() > 0 && index >= 0) {
 			if (cs.isRunning()) {
 				this._stop(reg);
 			}
