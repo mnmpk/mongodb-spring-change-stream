@@ -77,7 +77,7 @@ private ChangeStreamService<Document> changeStreamService;
 ChangeStream<Document> changeStream = ChangeStream.of("myChangeStream", Mode.BROADCAST);
 
 // Register and start the change stream
-changeStreamService.register("myCollection", changeStream, event -> {
+changeStreamService.run("myCollection", changeStream, event -> {
     System.out.println("Change detected: " + event.getOperationType());
     System.out.println("Document: " + event.getFullDocument());
 });
@@ -93,7 +93,7 @@ List<Bson> pipeline = List.of(
 ChangeStream<Document> changeStream = ChangeStream.of("filteredStream", Mode.BROADCAST)
     .pipeline(pipeline);
 
-changeStreamService.register("myCollection", changeStream, event -> {
+changeStreamService.run("myCollection", changeStream, event -> {
     // Only insert operations will be processed
     System.out.println("New document inserted: " + event.getFullDocument());
 });
@@ -106,7 +106,7 @@ ChangeStream<Document> changeStream = ChangeStream.of("recoverableStream", Mode.
     .resumeStrategy(ResumeStrategy.TIME)
     .saveTokenInterval(30000); // Save resume token every 30 seconds
 
-changeStreamService.register("myCollection", changeStream, event -> {
+changeStreamService.run("myCollection", changeStream, event -> {
     // Process events with automatic recovery on failures
 });
 ```
@@ -116,7 +116,7 @@ changeStreamService.register("myCollection", changeStream, event -> {
 ```java
 ChangeStream<Document> changeStream = ChangeStream.of("scaledStream", Mode.AUTO_SCALE);
 
-changeStreamService.register("myCollection", changeStream, event -> {
+changeStreamService.run("myCollection", changeStream, event -> {
     // Events will be distributed across multiple instances
     // Each instance processes a portion of the changes
 });
@@ -132,7 +132,7 @@ ChangeStream<Document> changeStream = ChangeStream.of("advancedStream", Mode.BRO
     .fullDocumentBeforeChange(FullDocumentBeforeChange.WHEN_AVAILABLE)
     .resumeStrategy(ResumeStrategy.BATCH);
 
-changeStreamService.register("myCollection", changeStream, event -> {
+changeStreamService.run("myCollection", changeStream, event -> {
     // Advanced change stream with full document lookup
 });
 ```
