@@ -132,7 +132,7 @@ public class ChangeStreamService<T> {
 		}
 
 		this.subscribe(event -> {
-			//watch instances collection change
+			// watch instances collection change
 			if (event.getNamespace().getCollectionName().equals(changeStreamProperties.getInstanceCollection())) {
 				try {
 					if (OperationType.INSERT == event.getOperationType()
@@ -140,6 +140,7 @@ public class ChangeStreamService<T> {
 						logger.info("change streams running in this node " + changeStreams.keySet());
 					}
 					String instance = event.getDocumentKey().getString("_id").getValue();
+					Document document = (Document) event.getFullDocument();
 					for (String csId : changeStreams.keySet()) {
 						ChangeStreamRegistry<T> reg = changeStreams.get(csId);
 						ChangeStream<T> cs = reg.getChangeStream();
@@ -148,10 +149,14 @@ public class ChangeStreamService<T> {
 								if (Mode.AUTO_SCALE == cs.getMode()) {
 									this._stop(reg);
 									run(reg, event.getFullDocument() != null
-											? ((Document) event.getFullDocument()).getDate("at")
+											? document.getDate("at")
 											: null);
 								} else {
-									reg.getInstances().add(instance);
+									if (document != null && document.containsKey(CHANGE_STREAMS_FIELD)) {
+										List<String> runningCSs = document.getList(CHANGE_STREAMS_FIELD, String.class);
+										if (runningCSs.contains(csId))
+											reg.getInstances().add(instance);
+									}
 								}
 								break;
 							case UPDATE:
@@ -204,6 +209,7 @@ public class ChangeStreamService<T> {
 											logger.info(
 													instance + " is dead, I'm still running change stream:"
 															+ cs.getId());
+											reg.getInstances().remove(instance);
 										} else {
 											logger.info(
 													instance + " is dead, " + changeStreamProperties.getHostname()
