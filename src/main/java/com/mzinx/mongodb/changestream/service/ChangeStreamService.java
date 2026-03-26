@@ -70,6 +70,7 @@ public class ChangeStreamService<T> {
 
 	@Autowired
 	private AggregationService aggregationService;
+
 	@Autowired
 	private PipelineRepository pipelineRepository;
 
@@ -83,7 +84,11 @@ public class ChangeStreamService<T> {
 
 	private static final String RESUME_TOKEN_PIPELINE_NAME = "getResumeToken";
 	private PipelineTemplate pipelineTemplate;
-	
+
+	//*****TODO: TEST AUTO SCALING, START/STOP node, START/STOP all*****
+
+
+
 	@PostConstruct
 	private void init() {
 		mongoTemplate.getCollection(changeStreamProperties.getResumeTokenCollection())
@@ -122,45 +127,11 @@ public class ChangeStreamService<T> {
 			// watch instances collection change
 			if (event.getNamespace().getCollectionName().equals(changeStreamProperties.getInstanceCollection())) {
 				try {
-					if (OperationType.INSERT == event.getOperationType()
-							|| OperationType.DELETE == event.getOperationType()) {
-						logger.info("change streams running in this node " + changeStreams.keySet());
-					}
-					String instance = event.getDocumentKey().getString("_id").getValue();
-					Document document = (Document) event.getFullDocument();
-
-					for (String csId : changeStreams.keySet()) {
-						ChangeStreamRegistry<T> reg = changeStreams.get(csId);
-						ChangeStream<T> cs = reg.getChangeStream();
-						switch (event.getOperationType()) {
-							case INSERT:
-								if (Mode.AUTO_SCALE == cs.getMode()) {
-									this._stop(reg);
-									run(reg, event.getFullDocument() != null
-											? document.getDate("at")
-											: null);
-								}
-								break;
-							case UPDATE:
-								if (Mode.AUTO_SCALE == cs.getMode()) {
-									if (!cs.isRunning()) {
-										logger.info(
-												cs.getId() + " is not yet running in "
-														+ changeStreamProperties.getHostname() + " start it now.");
-										scale(reg);
-									}
-								}
-								break;
-							case DELETE:
-								Document doc = this.runForSubstitute(csId, instance, changeStreamProperties.getHostname());
-								
-								if (Mode.AUTO_SCALE == cs.getMode()) {
-									this._stop(reg);
-									run(reg, ((Document) event.getFullDocumentBeforeChange()).getDate("at"));
-								}
-								break;
-							default:
-								break;
+					if (OperationType.DELETE == event.getOperationType()) {
+						for (String csId : changeStreams.keySet()) {
+							String instance = event.getDocumentKey().getString("_id").getValue();
+							this.runForSubstitute(csId, instance,
+									changeStreamProperties.getHostname());
 						}
 					}
 				} catch (RuntimeException e) {
@@ -172,11 +143,11 @@ public class ChangeStreamService<T> {
 
 	@PreDestroy
 	private void destroy() {
-		this.clear();
 		for (String csId : changeStreams.keySet()) {
 			this.stop(changeStreams.get(csId), false);
 			changeStreams.remove(csId);
 		}
+		this.clear();
 	}
 
 	private Document runForLeader(ChangeStreamRegistry<T> reg) {
@@ -184,9 +155,9 @@ public class ChangeStreamService<T> {
 				Filters.eq("_id", reg.getChangeStream().getId()), List.of(
 						new Document("$set", new Document()
 								.append("_id", reg.getChangeStream().getId())
-								.append("m",
+								.append("l",
 										new Document("$ifNull",
-												List.of("$m", changeStreamProperties.getHostname())))
+												List.of("$l", changeStreamProperties.getHostname())))
 								.append("at", new Date())
 								.append("i", new Document(
 										"$setUnion", List.of(
@@ -201,62 +172,79 @@ public class ChangeStreamService<T> {
 	private Document runForSubstitute(String csId, String deadHost) {
 		return runForSubstitute(csId, deadHost, null);
 	}
+
 	private Document runForSubstitute(String csId, String deadHost, String replacement) {
-		Document doc = mongoTemplate
-				.getCollection(changeStreamProperties.getChangeStreamCollection()).findOneAndUpdate(
-						Filters.eq("_id", csId), List.of(
-								new Document("$set", new Document()
-										.append("_id", csId)
-										.append("m", new Document("$cond",
-												List.of(new Document("$eq", List.of(new Document("$ifNull", List.of("$m", deadHost)), deadHost)),
-														replacement,
-														"$m")))
-										.append("at", new Date())
-										.append("i", new Document(
-												"$filter", new Document()
-														.append("input", "$i")
-														.append("as", "item")
-														.append("cond", new Document("$ne",
-																List.of("$$item", deadHost))))))),
-						new FindOneAndUpdateOptions().upsert(true).returnDocument(ReturnDocument.AFTER));
+		Document doc = null;
+		if (deadHost == null && replacement == null) {
+			doc = mongoTemplate
+					.getCollection(changeStreamProperties.getChangeStreamCollection()).findOneAndUpdate(
+							Filters.eq("_id", csId), List.of(
+									new Document("$set", new Document()
+											.append("_id", csId)
+											.append("l", null)
+											.append("at", new Date())
+											.append("i", List.of()))),
+							new FindOneAndUpdateOptions().upsert(true).returnDocument(ReturnDocument.AFTER));
+		} else {
+			doc = mongoTemplate
+					.getCollection(changeStreamProperties.getChangeStreamCollection()).findOneAndUpdate(
+							Filters.eq("_id", csId), List.of(
+									new Document("$set", new Document()
+											.append("_id", csId)
+											.append("l", new Document("$cond",
+													List.of(new Document("$eq",
+															List.of(new Document("$ifNull", List.of("$l", deadHost)),
+																	deadHost)),
+															replacement,
+															"$l")))
+											.append("at", new Date())
+											.append("i", new Document(
+													"$filter", new Document()
+															.append("input", "$i")
+															.append("as", "item")
+															.append("cond", new Document("$ne",
+																	List.of("$$item", deadHost))))))),
+							new FindOneAndUpdateOptions().upsert(true).returnDocument(ReturnDocument.AFTER));
+		}
 		if (changeStreams.containsKey(csId))
 			changeStreams.get(csId).setInstances(doc.getList("i", String.class));
 		return doc;
 	}
 
 	public void run(ChangeStreamRegistry<T> reg) {
-		this.run(reg, null);
+		logger.info("Start running change stream");
+		Document doc = runForLeader(reg);
+		this._run(doc.getString("l"), reg);
 	}
 
 	@Retryable(includes = { MongoException.class }, maxRetries = 10, delay = 5000, multiplier = 2)
-	public void run(ChangeStreamRegistry<T> reg, Date earliest) {
-		logger.info("Start running change stream");
-		Document doc = runForLeader(reg);
+	public void _run(String leader, ChangeStreamRegistry<T> reg) {
 		ChangeStream<T> cs = reg.getChangeStream();
-
 		logger.info("ResumeStrategy:" + cs.getResumeStrategy());
 		if (ResumeStrategy.NONE != cs.getResumeStrategy()) {
 			Aggregation<Document> agg = Aggregation.of(changeStreamProperties.getResumeTokenCollection(),
 					this.pipelineTemplate.getContent());
 			Map<String, Object> variables = new HashMap<>();
 			variables.put("csId", cs.getId());
-			variables.put("earliest", earliest);
+			variables.put("earliest", reg.getEarliestChangeAt());
 			List<Document> l = aggregationService.execute(agg, variables);
 			if (l.size() > 0) {
+				logger.info("Resume change stream " + cs.getId() + " from: " + l);
 				cs.resumeAfter(l.get(0).getString(TOKEN_FIELD));
 			}
+			reg.setEarliestChangeAt(null);
 		}
 
 		logger.info("Mode:" + cs.getMode());
 		if (Mode.AUTO_RECOVER == cs.getMode()) {
-			if (changeStreamProperties.getHostname().equals(doc.getString("m"))) {
+			if (changeStreamProperties.getHostname().equals(leader)) {
 				if (cs.isRunning()) {
 					logger.info("Change stream already running in this node");
 				} else {
 					start(reg);
 				}
 			} else {
-				logger.info("Change stream already running in other node:" + doc);
+				logger.info("Change stream already running in other node:" + leader);
 			}
 		} else if (Mode.AUTO_SCALE == cs.getMode()) {
 			scale(reg);
@@ -278,12 +266,12 @@ public class ChangeStreamService<T> {
 						saveCheckpoint(reg.getChangeStream().getId(), resumeToken);
 					});
 				}
-			} catch (MongoInterruptedException e){				
+			} catch (MongoInterruptedException e) {
 				logger.info("Change stream '" + reg.getChangeStream().getId() + "' Interrupted");
 			} catch (RuntimeException e) {
 				logger.error("Stopping change stream '" + reg.getChangeStream().getId() + "' due to unexpected error:",
 						e);
-				this._stop(reg);
+				reg.stop();
 				// Recover for unexpected exception
 				this.run(reg);
 			}
@@ -291,37 +279,6 @@ public class ChangeStreamService<T> {
 		}, taskExecutor);
 		reg.setCompletableFuture(completableFuture);
 		logger.info("Change stream " + reg.getChangeStream().getId() + " started");
-	}
-
-	public void stop(ChangeStreamRegistry<T> reg, boolean stopAll) {
-		logger.info("Stop change stream");
-		this._stop(reg);
-		runForSubstitute(reg.getChangeStream().getId(), stopAll?null:changeStreamProperties.getHostname());
-	}
-
-	public void _stop(ChangeStreamRegistry<T> reg) {
-		reg.getChangeStream().setRunning(false);
-		if (reg.getCompletableFuture() != null)
-			reg.getCompletableFuture().join();
-	}
-
-	private void scale(ChangeStreamRegistry<T> reg) {
-		ChangeStream<T> cs = reg.getChangeStream();
-		int index = new ArrayList<String>(this.instances).indexOf(changeStreamProperties.getHostname());
-		reg.setInstanceSize(this.instances.size());
-		reg.setInstanceIndex(index);
-		if (this.instances.size() > 0 && index >= 0) {
-			if (cs.isRunning()) {
-				this._stop(reg);
-			}
-			logger.info("change stream " + (index + 1) + " of " + this.instances.size()
-					+ " start running in "
-					+ changeStreamProperties.getHostname());
-			start(reg);
-		} else {
-			logger.info("Node " + changeStreamProperties.getHostname() + " is not ready to run change stream:"
-					+ cs.getId());
-		}
 	}
 
 	@Retryable(includes = { MongoException.class }, maxRetries = 10, delay = 1000, multiplier = 2)
@@ -334,6 +291,31 @@ public class ChangeStreamService<T> {
 								Updates.set(DATE_FIELD, new Date()),
 								Updates.set(TOKEN_FIELD, token))),
 				new UpdateOptions().upsert(true));
+	}
+
+	private void scale(ChangeStreamRegistry<T> reg) {
+		ChangeStream<T> cs = reg.getChangeStream();
+		int index = new ArrayList<String>(this.instances).indexOf(changeStreamProperties.getHostname());
+		reg.setInstanceSize(this.instances.size());
+		reg.setInstanceIndex(index);
+		if (this.instances.size() > 0 && index >= 0) {
+			if (cs.isRunning()) {
+				reg.stop();
+			}
+			logger.info("change stream " + (index + 1) + " of " + this.instances.size()
+					+ " start running in "
+					+ changeStreamProperties.getHostname());
+			start(reg);
+		} else {
+			logger.info("Node " + changeStreamProperties.getHostname() + " is not ready to run change stream:"
+					+ cs.getId());
+		}
+	}
+
+	public void stop(ChangeStreamRegistry<T> reg, boolean stopAll) {
+		logger.info("Stop change stream");
+		reg.stop();
+		runForSubstitute(reg.getChangeStream().getId(), stopAll ? null : changeStreamProperties.getHostname());
 	}
 
 	public void publish(ChangeStreamDocument<T> event) {
