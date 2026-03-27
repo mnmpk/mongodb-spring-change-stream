@@ -42,7 +42,7 @@ public class ChangeStreamRunner {
         cs = ChangeStream.of("change-stream", Mode.BOARDCAST,
                 List.of(Aggregates.match(
                         Filters.in("operationType", List.of("insert", "update", "delete")))));
-        this.changeStreamService.run(ChangeStreamRegistry.<Document>builder()
+        this.changeStreamService.start(ChangeStreamRegistry.<Document>builder()
                 .collectionName(changeStreamProperties.getChangeStreamCollection()).body(e -> {
                     this.logger.info("change stream changes: " + e);
                     String csId = e.getDocumentKey().getString("_id").getValue();
@@ -72,6 +72,7 @@ public class ChangeStreamRunner {
 
                             break;
                         case DELETE:
+                            //TODO
                             break;
                         default:
                             break;
@@ -85,45 +86,21 @@ public class ChangeStreamRunner {
                             if (Mode.AUTO_RECOVER == reg.getChangeStream().getMode()) {
                                 if (!reg.getChangeStream().isRunning()) {
                                     this.logger.info("change stream " + csId + " is not running, start and take over.");
-                                    this.changeStreamService.run(reg);
+                                    this.changeStreamService.start(reg);
                                 } else {
                                     this.logger.info("Still running the change stream:" + csId);
                                 }
                             } else {
-                                shouldRun(leader, instances, reg);
+                                this.changeStreamService.shouldRun(reg, Mode.AUTO_SCALE == reg.getChangeStream().getMode());
                             }
                         } else {
                             this.logger.info("I'm not the leader");
-                            shouldRun(leader, instances, reg);
+                            this.changeStreamService.shouldRun(reg, Mode.AUTO_SCALE == reg.getChangeStream().getMode());
                         }
                     }
                 }).changeStream(cs).build());
     }
 
-    private void shouldRun(String leader, List<String> instances, ChangeStreamRegistry<Document> reg) {
-        boolean shouldRun = instances.contains(changeStreamProperties.getHostname());
-        if (shouldRun && !reg.getChangeStream().isRunning()) {
-            this.logger.info("I should run the change stream " + reg.getChangeStream().getId() + ", start now.");
-            if (Mode.AUTO_RECOVER == reg.getChangeStream().getMode()) {
-                if (leader == null) {
-                    this.logger.info("leader stepped down, try to take over.");
-                    this.changeStreamService.run(reg);
-                }
-            } else {
-                reg.stop();
-                this.changeStreamService._run(leader, reg);
-            }
-        } else if (!shouldRun && reg.getChangeStream().isRunning()) {
-            this.logger.info("I shouldn't run the change stream " + reg.getChangeStream().getId() + ", stop now.");
-            reg.stop();
-        } else {
-            if (Mode.AUTO_SCALE == reg.getChangeStream().getMode()) {
-                this.logger.info("Restart the change stream " + reg.getChangeStream().getId() + " for auto scaling.");
-                reg.stop();
-                this.changeStreamService._run(leader, reg);
-            }
-        }
-    }
 
     @PreDestroy
     private void clear() {

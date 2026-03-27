@@ -37,7 +37,6 @@ import com.mongodb.client.model.Sorts;
 import com.mongodb.client.model.UpdateOptions;
 import com.mongodb.client.model.Updates;
 import com.mongodb.client.model.changestream.ChangeStreamDocument;
-import com.mongodb.client.model.changestream.OperationType;
 import com.mzinx.mongodb.aggregation.dao.PipelineRepository;
 import com.mzinx.mongodb.aggregation.model.Aggregation;
 import com.mzinx.mongodb.aggregation.model.PipelineTemplate;
@@ -85,9 +84,7 @@ public class ChangeStreamService<T> {
 	private static final String RESUME_TOKEN_PIPELINE_NAME = "getResumeToken";
 	private PipelineTemplate pipelineTemplate;
 
-	//*****TODO: TEST AUTO SCALING, START/STOP node, START/STOP all*****
-
-
+	// *****TODO: TEST AUTO SCALING, START/STOP node, START/STOP all*****
 
 	@PostConstruct
 	private void init() {
@@ -127,13 +124,28 @@ public class ChangeStreamService<T> {
 			// watch instances collection change
 			if (event.getNamespace().getCollectionName().equals(changeStreamProperties.getInstanceCollection())) {
 				try {
-					if (OperationType.DELETE == event.getOperationType()) {
-						for (String csId : changeStreams.keySet()) {
-							String instance = event.getDocumentKey().getString("_id").getValue();
-							this.runForSubstitute(csId, instance,
-									changeStreamProperties.getHostname());
+					String instance = event.getDocumentKey().getString("_id").getValue();
+					for (String csId : changeStreams.keySet()) {
+						ChangeStreamRegistry<T> reg = changeStreams.get(csId);
+
+						switch (event.getOperationType()) {
+							case INSERT:
+								this.shouldRun(reg, Mode.AUTO_SCALE == reg.getChangeStream().getMode());
+								break;
+							case UPDATE:
+								this.shouldRun(reg);
+								break;
+							case DELETE:
+								this.runForSubstitute(csId, instance,
+										changeStreamProperties.getHostname());
+								break;
+							default:
+								break;
+
 						}
 					}
+					// if (OperationType.DELETE == event.getOperationType()) {
+					// }
 				} catch (RuntimeException e) {
 					logger.error("Unexpected error while processing node changes:", e);
 				}
@@ -145,12 +157,12 @@ public class ChangeStreamService<T> {
 	private void destroy() {
 		for (String csId : changeStreams.keySet()) {
 			this.stop(changeStreams.get(csId), false);
-			changeStreams.remove(csId);
+			this.changeStreams.remove(csId);
 		}
 		this.clear();
 	}
 
-	private Document runForLeader(ChangeStreamRegistry<T> reg) {
+	private void runForLeader(ChangeStreamRegistry<T> reg) {
 		Document doc = mongoTemplate.getCollection(changeStreamProperties.getChangeStreamCollection()).findOneAndUpdate(
 				Filters.eq("_id", reg.getChangeStream().getId()), List.of(
 						new Document("$set", new Document()
@@ -164,16 +176,16 @@ public class ChangeStreamService<T> {
 												new Document("$ifNull", List.of("$i", List.of())),
 												List.of(changeStreamProperties.getHostname())))))),
 				new FindOneAndUpdateOptions().upsert(true).returnDocument(ReturnDocument.AFTER));
+		reg.setLeader(doc.getString("l"));
 		reg.setInstances(doc.getList("i", String.class));
-		changeStreams.put(reg.getChangeStream().getId(), reg);
-		return doc;
+		this.changeStreams.put(reg.getChangeStream().getId(), reg);
 	}
 
-	private Document runForSubstitute(String csId, String deadHost) {
-		return runForSubstitute(csId, deadHost, null);
+	private void runForSubstitute(String csId, String deadHost) {
+		this.runForSubstitute(csId, deadHost, null);
 	}
 
-	private Document runForSubstitute(String csId, String deadHost, String replacement) {
+	private void runForSubstitute(String csId, String deadHost, String replacement) {
 		Document doc = null;
 		if (deadHost == null && replacement == null) {
 			doc = mongoTemplate
@@ -206,21 +218,22 @@ public class ChangeStreamService<T> {
 																	List.of("$$item", deadHost))))))),
 							new FindOneAndUpdateOptions().upsert(true).returnDocument(ReturnDocument.AFTER));
 		}
-		if (changeStreams.containsKey(csId))
-			changeStreams.get(csId).setInstances(doc.getList("i", String.class));
-		return doc;
+		if (this.changeStreams.containsKey(csId)) {
+			this.changeStreams.get(csId).setLeader(doc.getString("l"));
+			this.changeStreams.get(csId).setInstances(doc.getList("i", String.class));
+		}
 	}
 
-	public void run(ChangeStreamRegistry<T> reg) {
-		logger.info("Start running change stream");
-		Document doc = runForLeader(reg);
-		this._run(doc.getString("l"), reg);
+	public void start(ChangeStreamRegistry<T> reg) {
+		this.logger.info("Start running change stream:" + reg.getChangeStream().getId());
+		this.runForLeader(reg);
+		this.prepareResumeToken(reg);
+		this.shouldRun(reg);
 	}
 
-	@Retryable(includes = { MongoException.class }, maxRetries = 10, delay = 5000, multiplier = 2)
-	public void _run(String leader, ChangeStreamRegistry<T> reg) {
+	private void prepareResumeToken(ChangeStreamRegistry<T> reg) {
 		ChangeStream<T> cs = reg.getChangeStream();
-		logger.info("ResumeStrategy:" + cs.getResumeStrategy());
+		this.logger.info("ResumeStrategy:" + cs.getResumeStrategy());
 		if (ResumeStrategy.NONE != cs.getResumeStrategy()) {
 			Aggregation<Document> agg = Aggregation.of(changeStreamProperties.getResumeTokenCollection(),
 					this.pipelineTemplate.getContent());
@@ -229,31 +242,149 @@ public class ChangeStreamService<T> {
 			variables.put("earliest", reg.getEarliestChangeAt());
 			List<Document> l = aggregationService.execute(agg, variables);
 			if (l.size() > 0) {
-				logger.info("Resume change stream " + cs.getId() + " from: " + l);
+				this.logger.info("Resume change stream " + cs.getId() + " from: " + l);
 				cs.resumeAfter(l.get(0).getString(TOKEN_FIELD));
 			}
 			reg.setEarliestChangeAt(null);
 		}
+	}
 
-		logger.info("Mode:" + cs.getMode());
-		if (Mode.AUTO_RECOVER == cs.getMode()) {
-			if (changeStreamProperties.getHostname().equals(leader)) {
-				if (cs.isRunning()) {
-					logger.info("Change stream already running in this node");
-				} else {
-					start(reg);
-				}
-			} else {
-				logger.info("Change stream already running in other node:" + leader);
-			}
-		} else if (Mode.AUTO_SCALE == cs.getMode()) {
-			scale(reg);
+	public void restart(ChangeStreamRegistry<T> reg) {
+		reg.stop();
+		this.prepareResumeToken(reg);
+		if (Mode.AUTO_SCALE == reg.getChangeStream().getMode()) {
+			this.scale(reg);
 		} else {
-			start(reg);
+			this.run(reg);
 		}
 	}
 
-	private void start(ChangeStreamRegistry<T> reg) {
+	public void shouldRun(ChangeStreamRegistry<T> reg) {
+		this.shouldRun(reg, false);
+	}
+
+	@Retryable(includes = { MongoException.class }, maxRetries = 10, delay = 5000, multiplier = 2)
+	public void shouldRun(ChangeStreamRegistry<T> reg, boolean forceRestart) {
+		this.logger.debug("csid: " + reg.getChangeStream().getId() + ", leader: " + reg.getLeader() + ", instances: "
+				+ reg.getInstances());
+		boolean shouldRun = reg.getInstances().contains(changeStreamProperties.getHostname());
+
+		this.logger.debug(reg.getChangeStream().getId() + " shouldRun:" + shouldRun + " isRunning:"
+				+ reg.getChangeStream().isRunning() + " Mode:" + reg.getChangeStream().getMode());
+		switch (reg.getChangeStream().getMode()) {
+			case BOARDCAST:
+				// Boardcast mode
+				// -First start
+				// --run for leader+register host
+				// --get resume token
+				// --start
+				// -New member join (new)
+				// --run for leader+register host
+				// --get resume token
+				// --start
+				// -New member join (old)
+				// --Do nothing
+				// -Member die
+				// --Do nothing
+				// -Leader die
+				// --Do nothing
+				// -Stop
+				// --deregister
+				// --stop
+				// -Start
+				// --run for leader+register host
+				// --get resume token
+				// --start
+				if (!reg.getChangeStream().isRunning()) {
+					run(reg);
+				} else if (!shouldRun) {
+					reg.stop();
+				} else {
+					this.logger.debug("do nothing");
+				}
+				break;
+			case AUTO_RECOVER:
+				// Auto recovery mode
+				// -First start
+				// --run for leader+register host
+				// --get resume token
+				// --start
+				// -New member join (new)
+				// --run for leader+register host
+				// --standby
+				// -New member join (old)
+				// --Do nothing
+				// -Member die
+				// --Do nothing
+				// -Leader die
+				// --run for leader
+				// --get resume token
+				// --restart
+				// -Stop
+				// --deregister
+				// --stop
+				// -Start
+				// --run for leader+register host
+				// --get resume token
+				// --start
+				if (reg.getLeader() == null) {
+					this.logger.info("leader stepped down, try to take over.");
+					this.start(reg);
+				} else if (this.changeStreamProperties.getHostname().equals(reg.getLeader())) {
+					if (!reg.getChangeStream().isRunning())
+						this.run(reg);
+				} else {
+					if (reg.getChangeStream().isRunning())
+						reg.stop();
+				}
+				break;
+			case AUTO_SCALE:
+				// Auto scale mode
+				// First start
+				// New member join
+				// Member die
+				// Leader die
+				// Stop
+				// Start
+				if (shouldRun && !reg.getChangeStream().isRunning()) {
+					this.logger
+							.info("I should run the change stream " + reg.getChangeStream().getId() + ", start now.");
+					this.scale(reg);
+				} else if (!shouldRun && reg.getChangeStream().isRunning()) {
+					this.logger
+							.info("I shouldn't run the change stream " + reg.getChangeStream().getId() + ", stop now.");
+					reg.stop();
+				} else if (forceRestart) {
+					this.restart(reg);
+				}
+				break;
+			default:
+				break;
+
+		}
+		// Deregister die member??
+	}
+
+	public void scale(ChangeStreamRegistry<T> reg) {
+		ChangeStream<T> cs = reg.getChangeStream();
+		int index = new ArrayList<String>(this.instances).indexOf(this.changeStreamProperties.getHostname());
+		reg.setInstanceSize(this.instances.size());
+		reg.setInstanceIndex(index);
+		if (this.instances.size() > 0 && index >= 0) {
+			if (cs.isRunning()) {
+				reg.stop();
+			}
+			this.logger.info("change stream " + (index + 1) + " of " + this.instances.size()
+					+ " start running in "
+					+ this.changeStreamProperties.getHostname());
+			this.run(reg);
+		} else {
+			this.logger.info("Node " + this.changeStreamProperties.getHostname() + " is not ready to run change stream:"
+					+ cs.getId());
+		}
+	}
+
+	private void run(ChangeStreamRegistry<T> reg) {
 		CompletableFuture<Object> completableFuture = CompletableFuture.supplyAsync(() -> {
 			try {
 				if (reg.getCollectionName() != null) {
@@ -267,18 +398,25 @@ public class ChangeStreamService<T> {
 					});
 				}
 			} catch (MongoInterruptedException e) {
-				logger.info("Change stream '" + reg.getChangeStream().getId() + "' Interrupted");
+				this.logger.info("Change stream '" + reg.getChangeStream().getId() + "' Interrupted");
 			} catch (RuntimeException e) {
-				logger.error("Stopping change stream '" + reg.getChangeStream().getId() + "' due to unexpected error:",
+				this.logger.error(
+						"Stopping change stream '" + reg.getChangeStream().getId() + "' due to unexpected error:",
 						e);
 				reg.stop();
 				// Recover for unexpected exception
-				this.run(reg);
+				this.start(reg);
 			}
 			return null;
 		}, taskExecutor);
 		reg.setCompletableFuture(completableFuture);
-		logger.info("Change stream " + reg.getChangeStream().getId() + " started");
+		this.logger.info("Change stream " + reg.getChangeStream().getId() + " started");
+	}
+
+	public void stop(ChangeStreamRegistry<T> reg, boolean stopAll) {
+		this.logger.info("Stop change stream");
+		reg.stop();
+		runForSubstitute(reg.getChangeStream().getId(), stopAll ? null : changeStreamProperties.getHostname());
 	}
 
 	@Retryable(includes = { MongoException.class }, maxRetries = 10, delay = 1000, multiplier = 2)
@@ -291,31 +429,6 @@ public class ChangeStreamService<T> {
 								Updates.set(DATE_FIELD, new Date()),
 								Updates.set(TOKEN_FIELD, token))),
 				new UpdateOptions().upsert(true));
-	}
-
-	private void scale(ChangeStreamRegistry<T> reg) {
-		ChangeStream<T> cs = reg.getChangeStream();
-		int index = new ArrayList<String>(this.instances).indexOf(changeStreamProperties.getHostname());
-		reg.setInstanceSize(this.instances.size());
-		reg.setInstanceIndex(index);
-		if (this.instances.size() > 0 && index >= 0) {
-			if (cs.isRunning()) {
-				reg.stop();
-			}
-			logger.info("change stream " + (index + 1) + " of " + this.instances.size()
-					+ " start running in "
-					+ changeStreamProperties.getHostname());
-			start(reg);
-		} else {
-			logger.info("Node " + changeStreamProperties.getHostname() + " is not ready to run change stream:"
-					+ cs.getId());
-		}
-	}
-
-	public void stop(ChangeStreamRegistry<T> reg, boolean stopAll) {
-		logger.info("Stop change stream");
-		reg.stop();
-		runForSubstitute(reg.getChangeStream().getId(), stopAll ? null : changeStreamProperties.getHostname());
 	}
 
 	public void publish(ChangeStreamDocument<T> event) {

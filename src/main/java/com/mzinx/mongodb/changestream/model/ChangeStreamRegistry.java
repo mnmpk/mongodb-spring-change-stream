@@ -24,6 +24,7 @@ public class ChangeStreamRegistry<T> {
     
     private int instanceIndex;
     private int instanceSize;
+    private String leader;
     private List<String> instances;
 
     private Date earliestChangeAt;
