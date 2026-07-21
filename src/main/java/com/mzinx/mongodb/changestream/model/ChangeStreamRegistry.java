@@ -3,9 +3,8 @@ package com.mzinx.mongodb.changestream.model;
 import java.util.Date;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
-import java.util.function.Consumer;
 
-import com.mongodb.client.model.changestream.ChangeStreamDocument;
+import com.mzinx.mongodb.changestream.listener.ChangeStreamListener;
 
 import lombok.AllArgsConstructor;
 import lombok.Builder;
@@ -19,7 +18,7 @@ import lombok.NoArgsConstructor;
 public class ChangeStreamRegistry<T> {
 	private String collectionName;
     private ChangeStream<T> changeStream;
-    private Consumer<ChangeStreamDocument<T>> body;
+    private ChangeStreamListener<T> listener;
     private CompletableFuture<Object> completableFuture;
     
     private int instanceIndex;
