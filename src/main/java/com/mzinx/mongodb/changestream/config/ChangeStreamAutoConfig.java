@@ -12,6 +12,7 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.ComponentScan;
 import org.springframework.context.annotation.Import;
+import org.springframework.scheduling.annotation.EnableScheduling;
 
 import com.mzinx.mongodb.changestream.model.ChangeStreamRegistry;
 
@@ -19,6 +20,7 @@ import com.mzinx.mongodb.changestream.model.ChangeStreamRegistry;
 @EnableConfigurationProperties(ChangeStreamProperties.class)
 @ConditionalOnProperty(prefix = "change-stream", name = "enabled", havingValue = "true", matchIfMissing = true)
 @ComponentScan("com.mzinx.mongodb.changestream")
+@EnableScheduling
 @Import(ScanRegistrar.class)
 public class ChangeStreamAutoConfig {
 
