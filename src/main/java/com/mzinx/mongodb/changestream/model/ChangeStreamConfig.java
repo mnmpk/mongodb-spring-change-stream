@@ -63,7 +63,7 @@ public class ChangeStreamConfig {
     private FullDocumentBeforeChange fullDocumentBeforeChange;
 
     /** Aggregation pipeline stages applied to the change stream. */
-    private List<Bson> pipeline;
+    private List<Document> pipeline;
 
     /**
      * Name of the {@link com.mzinx.mongodb.changestream.listener.ChangeStreamListener}
