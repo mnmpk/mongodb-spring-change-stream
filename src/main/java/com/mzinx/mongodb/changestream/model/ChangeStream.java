@@ -23,6 +23,7 @@ import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.changestream.ChangeStreamDocument;
 import com.mongodb.client.model.changestream.FullDocument;
 import com.mongodb.client.model.changestream.FullDocumentBeforeChange;
+import com.mzinx.mongodb.changestream.listener.ChangeStreamListener;
 
 import lombok.Data;
 
@@ -60,7 +61,7 @@ public class ChangeStream<T> {
     private boolean running = false;
     private Long saveTokenInterval = DEFAULT_SAVE_TOKEN_INTERVAL;
     private String resumeToken;
-    private Consumer<ChangeStreamDocument<T>> consumer;
+    private ChangeStreamListener<T> consumer;
 
     public ChangeStream(String id, Mode mode, Integer batchSize, Long maxAwaitTime,
             ResumeStrategy resumeStrategy, long saveTokenInterval, FullDocumentBeforeChange fullDocumentBeforeChange,
@@ -89,15 +90,15 @@ public class ChangeStream<T> {
     public void watch(MongoCollection<?> coll, ChangeStreamRegistry<T> reg,
             Consumer<BsonString> checkPoint) {
         this._changeStream = coll.watch(getScaledPipeline(reg), this.documentClass);
-        this.watch(reg.getBody(), checkPoint);
+        this.watch(reg.getListener(), checkPoint);
     }
 
     public void watch(MongoDatabase db, ChangeStreamRegistry<T> reg, Consumer<BsonString> checkPoint) {
         this._changeStream = db.watch(getScaledPipeline(reg), this.documentClass);
-        this.watch(reg.getBody(), checkPoint);
+        this.watch(reg.getListener(), checkPoint);
     }
 
-    public void watch(Consumer<ChangeStreamDocument<T>> consumer, Consumer<BsonString> checkPoint) {
+    public void watch(ChangeStreamListener<T> consumer, Consumer<BsonString> checkPoint) {
         logger.info("Initializing change stream " + this.getId());
 
         if (!this.isRunning()) {
@@ -129,7 +130,7 @@ public class ChangeStream<T> {
                 while (this.isRunning()) {
                     ChangeStreamDocument<T> e = this.getCursor().tryNext();
                     if (e != null) {
-                        this.getConsumer().accept(e);
+                        this.getConsumer().execute(e);
                         if ((ResumeStrategy.BATCH == this.getResumeStrategy() && this.getCursor().available() == 0)
                                 || ResumeStrategy.EVERY == this.getResumeStrategy()) {
                             checkPoint.accept(e.getResumeToken().getString("_data"));

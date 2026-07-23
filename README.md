@@ -63,9 +63,61 @@ change-stream.resumeTokenCollection=_resumeTokens
 
 # Collection name for storing instance information (default: _instances)
 change-stream.instanceCollection=_instances
+
+# Collection name for change stream coordination documents (default: _changeStreams)
+change-stream.changeStreamCollection=_changeStreams
+
+# Collection name for storing change stream configs (default: _changeStreamConfigs)
+change-stream.changeStreamConfigCollection=_changeStreamConfigs
+
+# Initial delay before the first config fetch in milliseconds (default: 10000)
+change-stream.configRefreshInitialDelay=10000
+
+# Interval between config fetches in milliseconds (default: 30000)
+change-stream.configRefreshInterval=30000
 ```
 
 ## Usage
+
+### Config-Driven Change Streams
+
+Change stream definitions can be stored in a MongoDB collection (default: `_changeStreamConfigs`). The `ChangeStreamManager` periodically fetches these configs and manages the change stream life cycles:
+
+- starts change streams for new enabled configs
+- restarts change streams whose definition changed
+- stops change streams whose config was removed or disabled
+
+Save a config with `ChangeStreamConfigService`:
+
+```java
+@Autowired
+private ChangeStreamConfigService changeStreamConfigService;
+
+changeStreamConfigService.save(ChangeStreamConfig.builder()
+    .id("orders-stream")                 // unique change stream id
+    .collectionName("orders")            // collection to watch (null = whole database)
+    .mode(Mode.BOARDCAST)                // BOARDCAST, AUTO_RECOVER or AUTO_SCALE
+    .resumeStrategy(ResumeStrategy.BATCH)
+    .pipeline(List.of(new Document("$match",
+        new Document("operationType", new Document("$in", List.of("insert", "update"))))))
+    .listener("orderListener")           // ChangeStreamListener bean name
+    .enabled(true)
+    .build());
+```
+
+The `listener` field references a Spring bean implementing `ChangeStreamListener<Document>`:
+
+```java
+@Component("orderListener")
+public class OrderListener implements ChangeStreamListener<Document> {
+    @Override
+    public void execute(ChangeStreamDocument<Document> event) {
+        System.out.println("Change detected: " + event.getOperationType());
+    }
+}
+```
+
+Disable a stream by saving the config with `enabled(false)`, or stop it permanently with `changeStreamConfigService.delete("orders-stream")`. Changes are picked up on the next refresh (`change-stream.configRefreshInterval`, default 30s).
 
 ### Basic Change Stream Setup
 

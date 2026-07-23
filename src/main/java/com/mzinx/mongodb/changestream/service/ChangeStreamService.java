@@ -85,7 +85,6 @@ public class ChangeStreamService<T> {
 	private static final String RESUME_TOKEN_PIPELINE_NAME = "getResumeToken";
 	private PipelineTemplate pipelineTemplate;
 
-	// *****TODO: TEST AUTO SCALING, START/STOP node, START/STOP all*****
 
 	@PostConstruct
 	private void init() {

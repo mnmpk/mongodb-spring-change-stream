@@ -18,4 +18,7 @@ public class ChangeStreamProperties {
     private String resumeTokenCollection = "_resumeTokens";
     private String instanceCollection = "_instances";
     private String changeStreamCollection = "_changeStreams";
+    private String changeStreamConfigCollection = "_changeStreamConfigs";
+    private long configRefreshInitialDelay = 10000; // ms
+    private long configRefreshInterval = 30000; // ms
 }
