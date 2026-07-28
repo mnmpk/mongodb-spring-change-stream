@@ -204,7 +204,9 @@ public class ChangeStreamService<T> {
 									new Document("$set", new Document()
 											.append("_id", csId)
 											.append("l", new Document("$cond",
-													List.of(new Document("$eq",
+													// Arrays.asList: replacement may be null
+													// (leader steps down without substitute)
+													java.util.Arrays.asList(new Document("$eq",
 															List.of(new Document("$ifNull", List.of("$l", deadHost)),
 																	deadHost)),
 															replacement,

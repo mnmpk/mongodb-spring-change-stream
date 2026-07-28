@@ -20,6 +20,13 @@ public class ChangeStreamRegistry<T> {
     private ChangeStream<T> changeStream;
     private ChangeStreamListener<T> listener;
     private CompletableFuture<Object> completableFuture;
+
+    /**
+     * The persisted config this registry was created from, set once the stream
+     * has been started successfully. {@code null} for streams not driven by a
+     * config (e.g. the coordination stream or programmatically started ones).
+     */
+    private ChangeStreamConfig config;
     
     private int instanceIndex;
     private int instanceSize;
