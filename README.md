@@ -55,8 +55,16 @@ change-stream.maxAwaitTime=800
 # Maximum lifetime for resume tokens in milliseconds (default: 86400000 = 24 hours)
 change-stream.tokenMaxLifeTime=86400000
 
-# Maximum timeout for operations in milliseconds (default: 50000)
+# Instance liveness timeout in milliseconds (default: 50000). Hosts whose
+# heartbeat in the instance collection is older than this are swept and
+# repaired out of every coordination document. Align it with
+# discovery.heartbeat.interval * discovery.heartbeat.max.
 change-stream.maxTimeout=50000
+
+# Leader lease duration in milliseconds for AUTO_RECOVER mode (default: 90000).
+# The lease is renewed on every reconcile cycle, so keep it a small multiple of
+# change-stream.configRefreshInterval.
+change-stream.leaseDuration=90000
 
 # Collection name for storing resume tokens (default: _resumeTokens)
 change-stream.resumeTokenCollection=_resumeTokens
@@ -119,107 +127,113 @@ public class OrderListener implements ChangeStreamListener<Document> {
 
 Disable a stream by saving the config with `enabled(false)`, or stop it permanently with `changeStreamConfigService.delete("orders-stream")`. Changes are picked up on the next refresh (`change-stream.configRefreshInterval`, default 30s).
 
-### Basic Change Stream Setup
+### Programmatic Change Streams
+
+Streams can also be registered programmatically through
+`ChangeStreamService.start(...)`; they are reconciled and supervised exactly
+like config-driven ones:
 
 ```java
 @Autowired
 private ChangeStreamService<Document> changeStreamService;
 
-// Create a change stream
-ChangeStream<Document> changeStream = ChangeStream.of("myChangeStream", Mode.BROADCAST);
+ChangeStreamRegistry<Document> registry = ChangeStreamRegistry.<Document>builder()
+    .collectionName("orders")            // null = whole database
+    .listener(event -> System.out.println("Change detected: " + event.getOperationType()))
+    .changeStream(ChangeStream.of("orders-stream", Mode.AUTO_RECOVER)
+        .resumeStrategy(ResumeStrategy.TIME, 30000)
+        .fullDocument(FullDocument.UPDATE_LOOKUP))
+    .build();
 
-// Register and start the change stream
-changeStreamService.run("myCollection", changeStream, event -> {
-    System.out.println("Change detected: " + event.getOperationType());
-    System.out.println("Document: " + event.getFullDocument());
-});
+changeStreamService.start(registry);
+
+// stop locally and deregister this host from the coordination document
+changeStreamService.stop(registry, false);
 ```
 
-### Change Stream with Pipeline
+### Monitoring Change Streams
+
+`ChangeStreamManager` exposes a read-only status API covering every registry
+(the coordination stream, config-driven and programmatic streams):
 
 ```java
-List<Bson> pipeline = List.of(
-    Aggregates.match(Filters.eq("operationType", "insert"))
-);
+@Autowired
+private ChangeStreamManager changeStreamManager;
 
-ChangeStream<Document> changeStream = ChangeStream.of("filteredStream", Mode.BROADCAST)
-    .pipeline(pipeline);
+// all registered change streams
+List<ChangeStreamStatus> all = changeStreamManager.getChangeStreams();
 
-changeStreamService.run("myCollection", changeStream, event -> {
-    // Only insert operations will be processed
-    System.out.println("New document inserted: " + event.getFullDocument());
-});
-```
+// streams currently running on this instance
+List<ChangeStreamStatus> active = changeStreamManager.getActiveChangeStreams();
 
-### Auto-Recovery Mode
-
-```java
-ChangeStream<Document> changeStream = ChangeStream.of("recoverableStream", Mode.AUTO_RECOVER)
-    .resumeStrategy(ResumeStrategy.TIME)
-    .saveTokenInterval(30000); // Save resume token every 30 seconds
-
-changeStreamService.run("myCollection", changeStream, event -> {
-    // Process events with automatic recovery on failures
-});
-```
-
-### Auto-Scaling Mode
-
-```java
-ChangeStream<Document> changeStream = ChangeStream.of("scaledStream", Mode.AUTO_SCALE);
-
-changeStreamService.run("myCollection", changeStream, event -> {
-    // Events will be distributed across multiple instances
-    // Each instance processes a portion of the changes
-});
-```
-
-### Advanced Configuration
-
-```java
-ChangeStream<Document> changeStream = ChangeStream.of("advancedStream", Mode.BROADCAST)
-    .batchSize(500)
-    .maxAwaitTime(1000)
-    .fullDocument(FullDocument.UPDATE_LOOKUP)
-    .fullDocumentBeforeChange(FullDocumentBeforeChange.WHEN_AVAILABLE)
-    .resumeStrategy(ResumeStrategy.BATCH);
-
-changeStreamService.run("myCollection", changeStream, event -> {
-    // Advanced change stream with full document lookup
-});
-```
-
-### Managing Change Streams
-
-```java
-// Start a specific change stream
-changeStreamService.run("myChangeStream");
-
-// Stop a specific change stream
-changeStreamService.stop("myChangeStream");
-
-// Check if running
-boolean isRunning = changeStreamService.isRunning("myChangeStream");
-
-// Get all registered change streams
-Map<String, ChangeStreamRegistry<?>> streams = changeStreamService.getChangeStreams();
+// a specific stream: running flag, leader, lease expiry, fencing term,
+// members, membership epoch, partition index/size, resume token, listener
+Optional<ChangeStreamStatus> status = changeStreamManager.getChangeStreamStatus("orders-stream");
 ```
 
 ## Operation Modes
 
 ### BROADCAST Mode
-- Basic mode where all events are processed by all registered consumers
-- Suitable for simple applications or when all instances need all events
+- Every registered member instance runs the full change stream
+- No leader is needed or elected
+- Suitable when all instances need all events (e.g. local cache invalidation)
 
 ### AUTO_RECOVER Mode
-- Provides fault tolerance by automatically recovering failed change streams
-- Uses instance tracking to restart streams on different nodes when failures occur
-- Requires instance collection monitoring
+- Exactly one instance runs the stream: the holder of the leader lease
+- Leadership is a server-time lease (`change-stream.leaseDuration`) stored in
+  the coordination document; the holder renews it on every reconcile cycle and
+  any other instance takes over atomically once the lease expires or the
+  holder's heartbeat dies
+- Every leadership change bumps a monotonic fencing term; resume token
+  checkpoints are stamped with the term and resume selection prefers the
+  highest term, so a deposed (zombie) leader can never move the legitimate
+  resume position
 
 ### AUTO_SCALE Mode
-- Distributes change stream processing across multiple instances
-- Uses document key hashing to partition events among instances
-- Provides horizontal scalability for high-volume change streams
+- Every member runs a disjoint hash partition of the stream (document key
+  hashing)
+- Partitions are derived from the sorted member list of the coordination
+  document, guarded by a membership epoch: all instances compute identical,
+  non-overlapping partitions and repartition exactly once per membership
+  change
+
+## Coordination and Reconciliation
+
+The distributed state of every change stream lives in a single coordination
+document (collection `change-stream.changeStreamCollection`, default
+`_changeStreams`) — the single source of truth:
+
+```javascript
+{
+  _id: "csId",
+  l:   { h: "host-a", until: ISODate },  // leader lease (null = no leader)
+  t:   NumberLong(7),                    // fencing term, bumped on leadership change
+  i:   ["host-a", "host-b"],             // sorted member hostnames
+  e:   NumberLong(12),                   // membership epoch, bumped on membership change
+  at:  ISODate                           // server time of the last effective change
+}
+```
+
+All mutations are single atomic aggregation-pipeline updates evaluated with
+MongoDB server time (`$$NOW`), so concurrent instances cannot corrupt the
+state and lease expiry never depends on application clocks. Legacy documents
+(pre-lease shape with `l` as a plain hostname string) are migrated lazily by
+the first update touching them.
+
+Every instance runs a periodic reconcile loop
+(`change-stream.configRefreshInterval`) that:
+
+1. sweeps dead instance heartbeats and atomically repairs every coordination
+   document (removes dead members, releases dead/expired leases)
+2. reconciles the persisted change stream configs (start/restart/stop)
+3. synchronizes each local registry from its coordination document and
+   starts, stops or repartitions the local watch loops per mode
+4. deletes orphaned coordination documents
+
+A coordination change stream additionally pushes leadership/membership changes
+to all instances with low latency, but it is only an optimization: the
+periodic loop is authoritative, so lost events are always healed within one
+cycle.
 
 ## Resume Strategies
 
@@ -241,11 +255,19 @@ Map<String, ChangeStreamRegistry<?>> streams = changeStreamService.getChangeStre
 
 ## Instance Management
 
-For AUTO_RECOVER and AUTO_SCALE modes, the library maintains an instance collection to track running instances and their assigned change streams. This enables:
+For AUTO_RECOVER and AUTO_SCALE modes, instance liveness comes from heartbeats
+in the instance collection (default `_instances`), typically written by the
+companion `mongodb-spring-discovery` module. This enables:
 
-- Automatic failover when instances go down
+- Automatic failover when instances go down (dead heartbeats are actively
+  swept and repaired out of every coordination document, without waiting for
+  the MongoDB TTL monitor)
 - Load balancing across multiple instances
 - Coordination between distributed nodes
+
+When the instance collection is empty (no discovery/heartbeat mechanism
+active), liveness is unknown and membership repair is skipped; multi-instance
+deployments should therefore always run the discovery module.
 
 ## License
 

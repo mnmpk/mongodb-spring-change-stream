@@ -1,5 +1,6 @@
 package com.mzinx.mongodb.changestream.model;
 
+import java.util.Date;
 import java.util.List;
 
 import com.mzinx.mongodb.changestream.model.ChangeStream.Mode;
@@ -32,11 +33,23 @@ public class ChangeStreamStatus {
     /** Whether the change stream cursor is currently running on this instance. */
     private boolean running;
 
-    /** Hostname of the current leader instance. */
+    /**
+     * Hostname of the current leader lease holder (AUTO_RECOVER), or
+     * {@code null} when the mode requires no leader or no lease is held.
+     */
     private String leader;
+
+    /** Expiry of the current leader lease (server time), if any. */
+    private Date leaseUntil;
+
+    /** Fencing term of the current leadership. */
+    private long term;
 
     /** Hostnames of all instances registered for this change stream. */
     private List<String> instances;
+
+    /** Membership epoch of the coordination document. */
+    private long epoch;
 
     /** Index of this instance among the cluster instances (AUTO_SCALE). */
     private int instanceIndex;

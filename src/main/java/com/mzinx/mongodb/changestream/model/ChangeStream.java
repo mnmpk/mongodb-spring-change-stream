@@ -87,6 +87,23 @@ public class ChangeStream<T> {
         this.running = running;
     }
 
+    /**
+     * Atomically claims the run flag. The claimer owns the stream life cycle:
+     * {@link #watch} only loops while the flag stays set and never sets it
+     * itself, so a stop requested between claiming and the watch task actually
+     * starting is honored (the loop exits immediately instead of resurrecting
+     * the stream).
+     *
+     * @return {@code true} when the flag was claimed by this call,
+     *         {@code false} when the stream was already claimed/running
+     */
+    public synchronized boolean claim() {
+        if (this.running)
+            return false;
+        this.running = true;
+        return true;
+    }
+
     public void watch(MongoCollection<?> coll, ChangeStreamRegistry<T> reg,
             Consumer<BsonString> checkPoint) {
         this._changeStream = coll.watch(getScaledPipeline(reg), this.documentClass);
@@ -98,52 +115,63 @@ public class ChangeStream<T> {
         this.watch(reg.getListener(), checkPoint);
     }
 
+    /**
+     * Runs the blocking watch loop. The run flag must have been claimed by the
+     * caller through {@link #claim()} beforehand; if a stop was requested in
+     * the meantime ({@link #setRunning setRunning(false)}), the loop exits
+     * immediately without opening a cursor.
+     */
     public void watch(ChangeStreamListener<T> consumer, Consumer<BsonString> checkPoint) {
         logger.info("Initializing change stream " + this.getId());
 
         if (!this.isRunning()) {
-            this.setRunning(true);
-            this.consumer = consumer;
-            if (this.batchSize != null) {
-                this._changeStream = this._changeStream.batchSize(this.batchSize);
-            }
-            if (this.maxAwaitTime != null) {
-                this._changeStream = this._changeStream.maxAwaitTime(this.maxAwaitTime, TimeUnit.MILLISECONDS);
-            }
-            if (resumeToken != null) {
-                this._changeStream = this._changeStream
-                        .resumeAfter(new Document("_data", resumeToken).toBsonDocument());
-            }
-            if (fullDocument != null) {
-                this._changeStream = this._changeStream.fullDocument(fullDocument);
-            }
-            if (fullDocumentBeforeChange != null) {
-                this._changeStream = this._changeStream.fullDocumentBeforeChange(fullDocumentBeforeChange);
-            }
-            this.cursor = this._changeStream.cursor();
-            ScheduledExecutorService scheduler = null;
-            if (ResumeStrategy.TIME == this.getResumeStrategy()) {
-                scheduler = this.timer(this, checkPoint);
-            }
+            logger.info("Change stream " + this.getId() + " was stopped before starting");
+            return;
+        }
+        this.consumer = consumer;
+        if (this.batchSize != null) {
+            this._changeStream = this._changeStream.batchSize(this.batchSize);
+        }
+        if (this.maxAwaitTime != null) {
+            this._changeStream = this._changeStream.maxAwaitTime(this.maxAwaitTime, TimeUnit.MILLISECONDS);
+        }
+        if (resumeToken != null) {
+            this._changeStream = this._changeStream
+                    .resumeAfter(new Document("_data", resumeToken).toBsonDocument());
+        }
+        if (fullDocument != null) {
+            this._changeStream = this._changeStream.fullDocument(fullDocument);
+        }
+        if (fullDocumentBeforeChange != null) {
+            this._changeStream = this._changeStream.fullDocumentBeforeChange(fullDocumentBeforeChange);
+        }
+        this.cursor = this._changeStream.cursor();
+        ScheduledExecutorService scheduler = null;
+        if (ResumeStrategy.TIME == this.getResumeStrategy()) {
+            scheduler = this.timer(this, checkPoint);
+        }
 
-            try {
-                while (this.isRunning()) {
-                    ChangeStreamDocument<T> e = this.getCursor().tryNext();
-                    if (e != null) {
-                        this.getConsumer().execute(e);
-                        if ((ResumeStrategy.BATCH == this.getResumeStrategy() && this.getCursor().available() == 0)
-                                || ResumeStrategy.EVERY == this.getResumeStrategy()) {
-                            checkPoint.accept(e.getResumeToken().getString("_data"));
-                        }
+        try {
+            while (this.isRunning()) {
+                ChangeStreamDocument<T> e = this.getCursor().tryNext();
+                if (e != null) {
+                    this.getConsumer().execute(e);
+                    if ((ResumeStrategy.BATCH == this.getResumeStrategy() && this.getCursor().available() == 0)
+                            || ResumeStrategy.EVERY == this.getResumeStrategy()) {
+                        checkPoint.accept(e.getResumeToken().getString("_data"));
                     }
                 }
-            } finally {
-                logger.info("Change stream " + this.getId() + " stopped");
-                if (scheduler != null)
-                    scheduler.shutdown();
             }
-        } else {
-            logger.info("Change stream " + this.getId() + " is already running");
+        } finally {
+            logger.info("Change stream " + this.getId() + " stopped");
+            this.setRunning(false);
+            if (scheduler != null)
+                scheduler.shutdown();
+            try {
+                this.cursor.close();
+            } catch (RuntimeException e) {
+                logger.debug("Error closing change stream cursor", e);
+            }
         }
     }
 

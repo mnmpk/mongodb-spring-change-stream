@@ -1,112 +1,85 @@
 package com.mzinx.mongodb.changestream.listener;
 
-import java.util.ArrayList;
-import java.util.Date;
-import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
-import org.bson.BsonValue;
 import org.bson.Document;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import com.mongodb.client.model.changestream.ChangeStreamDocument;
-import com.mzinx.mongodb.changestream.config.ChangeStreamProperties;
-import com.mzinx.mongodb.changestream.model.ChangeStream.Mode;
+import com.mzinx.mongodb.changestream.model.ChangeStreamCoordination;
 import com.mzinx.mongodb.changestream.model.ChangeStreamRegistry;
 import com.mzinx.mongodb.changestream.service.ChangeStreamService;
 
+/**
+ * Listener of the coordination change stream (watching the coordination
+ * collection itself). It is a pure low-latency trigger: it never mutates the
+ * local registry, it only requests an asynchronous reconcile of the affected
+ * change stream, which re-reads the coordination document (single source of
+ * truth) under the per-stream lock. Pure lease renewals ({@code l.until}) are
+ * ignored, so the steady-state renewal traffic of AUTO_RECOVER leaders does
+ * not cause reconcile churn on followers.
+ * <p>
+ * The periodic reconcile loop of the manager provides the same convergence
+ * authoritatively, so this stream (and any events it may lose) is not a
+ * correctness dependency.
+ */
 @Component
-public class ChangeStreamWatch<T> implements ChangeStreamListener<Document>{
-    private final ChangeStreamProperties changeStreamProperties;
+public class ChangeStreamWatch implements ChangeStreamListener<Document> {
+
+    private static final String LEASE_UNTIL_KEY = ChangeStreamCoordination.LEADER_FIELD + "."
+            + ChangeStreamCoordination.LEADER_UNTIL_FIELD;
+
+    private static final Set<String> RELEVANT_KEYS = Set.of(
+            ChangeStreamCoordination.LEADER_FIELD,
+            ChangeStreamCoordination.MEMBERS_FIELD,
+            ChangeStreamCoordination.EPOCH_FIELD,
+            ChangeStreamCoordination.TERM_FIELD);
+
     private final ChangeStreamService<Document> changeStreamService;
     private final Map<String, ChangeStreamRegistry<Document>> changeStreams;
 
     Logger logger = LoggerFactory.getLogger(getClass());
 
-        ChangeStreamWatch(ChangeStreamProperties changeStreamProperties, ChangeStreamService<Document> changeStreamService, Map<String, ChangeStreamRegistry<Document>> changeStreams) {
-                this.changeStreamProperties = changeStreamProperties;
-                this.changeStreamService = changeStreamService;
-                this.changeStreams = changeStreams;
+    ChangeStreamWatch(ChangeStreamService<Document> changeStreamService,
+            Map<String, ChangeStreamRegistry<Document>> changeStreams) {
+        this.changeStreamService = changeStreamService;
+        this.changeStreams = changeStreams;
+    }
+
+    @Override
+    public void execute(ChangeStreamDocument<Document> e) {
+        this.logger.debug("coordination change: " + e);
+        String csId = e.getDocumentKey().getString("_id").getValue();
+        if (!this.changeStreams.containsKey(csId)) {
+            this.logger.debug("Change stream " + csId + " is not registered on this instance, ignoring.");
+            return;
         }
-    public void execute(ChangeStreamDocument<Document> e){
+        if (this.isRelevant(e)) {
+            this.logger.debug("Coordination of " + csId + " changed, requesting reconcile");
+            this.changeStreamService.requestReconcile(csId);
+        }
+    }
 
-                    this.logger.info("change stream changes: " + e);
-                    String csId = e.getDocumentKey().getString("_id").getValue();
-                    ChangeStreamRegistry<Document> reg = changeStreams.get(csId);
-                    if (reg == null) {
-                        this.logger.debug("Change stream " + csId + " is not registered on this instance, ignoring.");
-                        return;
-                    }
-                    String leader = reg.getLeader();
-                    List<String> instances = new ArrayList<>();
-                    if (reg.getInstances() != null)
-                        instances.addAll(reg.getInstances());
-                    Date changeAt = null;
-                    boolean skip = false;
-                    switch (e.getOperationType()) {
-                        case INSERT:
-                            leader = e.getFullDocument().getString("l");
-                            instances.clear();
-                            instances.addAll(e.getFullDocument().getList("i", String.class));
-                            changeAt = e.getFullDocument().getDate("at");
-                            break;
-                        case UPDATE:
-
-                            if (e.getUpdateDescription().getUpdatedFields().containsKey("l")) {
-                                BsonValue leaderValue = e.getUpdateDescription().getUpdatedFields().get("l");
-                                leader = leaderValue != null && leaderValue.isString()
-                                        ? leaderValue.asString().getValue()
-                                        : null;
-                            }
-                            if (e.getUpdateDescription().getUpdatedFields().containsKey("i")) {
-                                instances.clear();
-                                instances.addAll(e.getUpdateDescription().getUpdatedFields().getArray("i").stream()
-                                        .map(i -> i.asString().getValue()).toList());
-                            }
-                            if (!e.getUpdateDescription().getUpdatedFields().containsKey("l")
-                                    && !e.getUpdateDescription().getUpdatedFields().containsKey("i"))
-                                skip = true;
-                            if (e.getUpdateDescription().getUpdatedFields().containsKey("at"))
-                                changeAt = new Date(
-                                        e.getUpdateDescription().getUpdatedFields().getDateTime("at").getValue());
-
-                            break;
-                        case DELETE:
-                            this.logger.info("Change stream " + csId + " was removed, stop local runner.");
-                            reg.setLeader(null);
-                            reg.setInstances(List.of());
-                            reg.stop();
-                            skip = true;
-                            break;
-                        default:
-                            break;
-                    }
-                    if (!skip) {
-                        reg.setLeader(leader);
-                        reg.setInstances(instances);
-                        if (changeAt != null
-                                && (reg.getEarliestChangeAt() == null || changeAt.before(reg.getEarliestChangeAt())))
-                            reg.setEarliestChangeAt(changeAt);
-                        if (changeStreamProperties.getHostname().equals(leader)) {
-                            this.logger.info("I'm the leader, check change stream " + csId + " is running:"
-                                    + reg.getChangeStream().isRunning());
-                            if (Mode.AUTO_RECOVER == reg.getChangeStream().getMode()) {
-                                if (!reg.getChangeStream().isRunning()) {
-                                    this.logger.info("change stream " + csId + " is not running, start and take over.");
-                                    this.changeStreamService.start(reg);
-                                } else {
-                                    this.logger.info("Still running the change stream:" + csId);
-                                }
-                            } else {
-                                this.changeStreamService.shouldRun(reg, Mode.AUTO_SCALE == reg.getChangeStream().getMode());
-                            }
-                        } else {
-                            this.logger.info("I'm not the leader");
-                            this.changeStreamService.shouldRun(reg, Mode.AUTO_SCALE == reg.getChangeStream().getMode());
-                        }
-                    }
-                
+    private boolean isRelevant(ChangeStreamDocument<Document> e) {
+        switch (e.getOperationType()) {
+            case INSERT:
+            case REPLACE:
+            case DELETE:
+                return true;
+            case UPDATE:
+                if (e.getUpdateDescription() == null || e.getUpdateDescription().getUpdatedFields() == null)
+                    return true;
+                // leadership, membership, epoch or term changes matter; pure
+                // lease renewals (l.until) and timestamps do not
+                return e.getUpdateDescription().getUpdatedFields().keySet().stream()
+                        .anyMatch(key -> RELEVANT_KEYS.contains(key)
+                                || (key.startsWith(ChangeStreamCoordination.LEADER_FIELD + ".")
+                                        && !key.equals(LEASE_UNTIL_KEY)));
+            default:
+                return false;
+        }
     }
 }

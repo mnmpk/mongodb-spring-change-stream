@@ -24,22 +24,32 @@ import com.mzinx.mongodb.changestream.model.ChangeStreamConfig;
 import com.mzinx.mongodb.changestream.model.ChangeStreamRegistry;
 import com.mzinx.mongodb.changestream.model.ChangeStreamStatus;
 import com.mzinx.mongodb.changestream.service.ChangeStreamConfigService;
+import com.mzinx.mongodb.changestream.service.ChangeStreamCoordinator;
 import com.mzinx.mongodb.changestream.service.ChangeStreamService;
 
 import jakarta.annotation.PreDestroy;
 
 /**
- * Periodically fetches {@link ChangeStreamConfig} documents from the config
- * collection and manages the life cycle of the corresponding change streams:
- * <ul>
- * <li>starts change streams for new enabled configs</li>
- * <li>restarts change streams whose config definition changed</li>
- * <li>stops change streams whose config was removed or disabled</li>
- * </ul>
- * All change stream registries (the coordination stream, config-driven streams
- * and streams started programmatically through
- * {@link ChangeStreamService#start(ChangeStreamRegistry)}) are managed through
- * the shared registry map, and their runtime status can be queried via
+ * Periodic reconciler driving every change stream registered on this instance
+ * towards its desired state. Each cycle performs, in order:
+ * <ol>
+ * <li><b>coordinate</b> — ensures the coordination change stream (watching the
+ * coordination collection) is registered, so leader/membership changes are
+ * propagated with low latency; the loop itself remains authoritative when
+ * events are lost.</li>
+ * <li><b>housekeeping</b> — actively sweeps dead instance heartbeats and
+ * atomically repairs every coordination document (removes dead members,
+ * releases dead or expired leader leases).</li>
+ * <li><b>refresh</b> — reconciles persisted {@link ChangeStreamConfig}s:
+ * starts new enabled configs, restarts changed definitions, stops disabled or
+ * removed ones.</li>
+ * <li><b>reconcileAll</b> — synchronizes every local registry from its
+ * coordination document (the single source of truth) and starts/stops/
+ * repartitions the local watch loops per mode.</li>
+ * <li><b>orphan cleanup</b> — deletes coordination documents that no config
+ * and no instance references anymore.</li>
+ * </ol>
+ * Runtime status of all registries can be queried via
  * {@link #getChangeStreams()}, {@link #getActiveChangeStreams()} and
  * {@link #getChangeStreamStatus(String)}.
  */
@@ -53,6 +63,7 @@ public class ChangeStreamManager {
     private final ChangeStreamProperties changeStreamProperties;
     private final ChangeStreamService<Document> changeStreamService;
     private final ChangeStreamConfigService changeStreamConfigService;
+    private final ChangeStreamCoordinator coordinator;
 
     /**
      * All change stream registries, keyed by change stream id. This is the shared
@@ -67,11 +78,12 @@ public class ChangeStreamManager {
 
     ChangeStreamManager(ApplicationContext context, ChangeStreamProperties changeStreamProperties,
             ChangeStreamService<Document> changeStreamService, ChangeStreamConfigService changeStreamConfigService,
-            Map<String, ChangeStreamRegistry<Document>> changeStreams) {
+            ChangeStreamCoordinator coordinator, Map<String, ChangeStreamRegistry<Document>> changeStreams) {
         this.context = context;
         this.changeStreamProperties = changeStreamProperties;
         this.changeStreamService = changeStreamService;
         this.changeStreamConfigService = changeStreamConfigService;
+        this.coordinator = coordinator;
         this.changeStreams = changeStreams;
     }
 
@@ -79,17 +91,31 @@ public class ChangeStreamManager {
     void watch() {
         this.coordinate();
         try {
-            this.refresh();
+            this.housekeeping();
+        } catch (RuntimeException e) {
+            logger.error("Unable to run coordination housekeeping:", e);
+        }
+        Set<String> configIds = null;
+        try {
+            configIds = this.refresh();
         } catch (RuntimeException e) {
             logger.error("Unable to refresh change stream configs:", e);
+        }
+        this.reconcileAll();
+        if (configIds != null) {
+            try {
+                this.cleanOrphans(configIds);
+            } catch (RuntimeException e) {
+                logger.error("Unable to clean orphaned coordination documents:", e);
+            }
         }
     }
 
     /**
      * Starts the coordination change stream watching the change stream
      * coordination collection, so leader/instance changes are propagated to all
-     * nodes. Its registry is kept in the shared registry map like any other
-     * change stream.
+     * nodes with low latency. Its registry is kept in the shared registry map
+     * like any other change stream and reconciled by the same loop.
      */
     private void coordinate() {
         if (this.coordinating)
@@ -111,10 +137,29 @@ public class ChangeStreamManager {
     }
 
     /**
-     * Fetches change stream configs from the config collection and reconciles
-     * them with the currently managed change streams.
+     * Active liveness maintenance: deletes stale instance heartbeats (instead
+     * of waiting for the TTL monitor) and repairs every coordination document
+     * against the fresh alive set (removing dead members and releasing dead or
+     * expired leases). Both operations are atomic and idempotent, so every
+     * instance can run them on every cycle. Skipped entirely when the instance
+     * collection is empty (no discovery/heartbeat mechanism active, liveness
+     * unknown).
      */
-    private void refresh() {
+    private void housekeeping() {
+        long swept = coordinator.sweepDeadInstances();
+        if (swept > 0)
+            logger.info("Swept " + swept + " dead instance(s)");
+        List<String> alive = coordinator.aliveInstances();
+        if (!alive.isEmpty())
+            coordinator.repair(alive);
+    }
+
+    /**
+     * Fetches change stream configs from the config collection and reconciles
+     * them with the currently managed change streams. Returns the ids of all
+     * known configs (enabled or not) for the orphan cleanup.
+     */
+    private Set<String> refresh() {
         List<ChangeStreamConfig> configs = this.changeStreamConfigService.findAll();
         Set<String> known = new HashSet<>();
 
@@ -154,6 +199,38 @@ public class ChangeStreamManager {
                 this.stop(entry.getKey());
             }
         }
+        return known;
+    }
+
+    /**
+     * Converges every registered change stream to its coordination document:
+     * the database-to-memory synchronization plus the mode state machine, all
+     * serialized per stream inside {@link ChangeStreamService#reconcile}.
+     */
+    private void reconcileAll() {
+        for (ChangeStreamRegistry<Document> reg : List.copyOf(this.changeStreams.values())) {
+            try {
+                this.changeStreamService.reconcile(reg);
+            } catch (RuntimeException e) {
+                logger.error("Unable to reconcile change stream "
+                        + reg.getChangeStream().getId() + ":", e);
+            }
+        }
+    }
+
+    /**
+     * Deletes coordination documents that neither belong to a known config,
+     * nor to a locally registered stream, nor have any member left (streams
+     * registered programmatically on other instances keep their members and
+     * are therefore never touched).
+     */
+    private void cleanOrphans(Set<String> configIds) {
+        Set<String> keep = new HashSet<>(configIds);
+        keep.add(COORDINATION_STREAM_ID);
+        keep.addAll(this.changeStreams.keySet());
+        long removed = coordinator.deleteOrphans(keep);
+        if (removed > 0)
+            logger.info("Removed " + removed + " orphaned coordination document(s)");
     }
 
     private void start(ChangeStreamConfig config) {
@@ -173,14 +250,15 @@ public class ChangeStreamManager {
     }
 
     private void stop(String csId) {
-        ChangeStreamRegistry<Document> reg = this.changeStreams.get(csId);
+        // deregister from the map first, so reconcile requests queued by the
+        // coordination events of the stop itself cannot resurrect the stream
+        ChangeStreamRegistry<Document> reg = this.changeStreams.remove(csId);
         if (reg != null) {
             try {
                 this.changeStreamService.stop(reg, false);
             } catch (RuntimeException e) {
                 logger.error("Unable to stop change stream " + csId + ":", e);
             }
-            this.changeStreams.remove(csId);
         }
     }
 
@@ -220,7 +298,10 @@ public class ChangeStreamManager {
                 .resumeStrategy(cs.getResumeStrategy())
                 .running(cs.isRunning())
                 .leader(reg.getLeader())
+                .leaseUntil(reg.getLeaseUntil())
+                .term(reg.getTerm())
                 .instances(reg.getInstances() == null ? List.of() : List.copyOf(reg.getInstances()))
+                .epoch(reg.getEpoch())
                 .instanceIndex(reg.getInstanceIndex())
                 .instanceSize(reg.getInstanceSize())
                 .resumeToken(cs.getResumeToken())
