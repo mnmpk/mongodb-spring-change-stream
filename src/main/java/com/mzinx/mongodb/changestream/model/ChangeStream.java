@@ -145,10 +145,12 @@ public class ChangeStream<T> {
         if (fullDocumentBeforeChange != null) {
             this._changeStream = this._changeStream.fullDocumentBeforeChange(fullDocumentBeforeChange);
         }
-        //TODO: add handling when resume token is invalid
-        //Case 1: out of oplog windows
-        //Case 2: sometimes happened in AUTO_SCALE mode, seems like the partitioned change stream will have different series of resume token? (Not confirmed yet)
-        //Command execution failed on MongoDB server with error 280 (ChangeStreamFatalError): 'PlanExecutor error during aggregation :: caused by :: cannot resume stream; the resume token was not found. {_data: "826A68AEB0000000012B042C0100296E5A10042E714C8BD34F4748B84E1EC13007D7AE463C6F7065726174696F6E54797065003C696E736572740046646F63756D656E744B65790046645F696400646A68AEB07ABA0D459AB8CD18000004"}' on server mzinx-cluster-shard-00-01.y8j6q.mongodb.net:27017. The full response is {"errorLabels": ["NonResumableChangeStreamError"], "ok": 0.0, "errmsg": "PlanExecutor error during aggregation :: caused by :: cannot resume stream; the resume token was not found. {_data: \"826A68AEB0000000012B042C0100296E5A10042E714C8BD34F4748B84E1EC13007D7AE463C6F7065726174696F6E54797065003C696E736572740046646F63756D656E744B65790046645F696400646A68AEB07ABA0D459AB8CD18000004\"}", "code": 280, "codeName": "ChangeStreamFatalError", "$clusterTime": {"clusterTime": {"$timestamp": {"t": 1785245360, "i": 6}}, "signature": {"hash": {"$binary": {"base64": "H5d6YuZdWQ4RwOwACgxUQHUaciM=", "subType": "00"}}, "keyId": 7606388459900502017}}, "operationTime": {"$timestamp": {"t": 1785245360, "i": 6}}}
+        // Invalid resume tokens (out of oplog window: ChangeStreamHistoryLost 286;
+        // token not part of this stream's series, e.g. checkpoints of a differently
+        // partitioned AUTO_SCALE pipeline: ChangeStreamFatalError 280 /
+        // NonResumableChangeStreamError) are recovered by ChangeStreamService:
+        // the failure propagates from here, the poisoned checkpoint is discarded
+        // and the stream is restarted without it.
         this.cursor = this._changeStream.cursor();
         ScheduledExecutorService scheduler = null;
         if (ResumeStrategy.TIME == this.getResumeStrategy()) {

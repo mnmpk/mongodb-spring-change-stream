@@ -442,17 +442,14 @@ public class ChangeStreamService<T> {
 			} catch (MongoInterruptedException e) {
 				this.logger.info("Change stream '" + csId + "' interrupted");
 			} catch (RuntimeException e) {
-				if (e instanceof MongoCommandException mce && mce.getCode() == 286) {
-					this.logger.warn("Change stream '" + csId + "' history lost, token: '"
-							+ cs.getResumeToken() + "', restarting without resume token");
+				if (isNonResumable(e) && cs.getResumeToken() != null) {
+					this.logger.warn("Change stream '" + csId + "' cannot resume from token '"
+							+ cs.getResumeToken()
+							+ "' (out of oplog window, or a token of an incompatible pipeline"
+							+ " e.g. after AUTO_SCALE repartitioning), discarding the checkpoint"
+							+ " and restarting: " + e.getMessage());
+					this.discardCheckpoints(csId, cs.getResumeToken());
 					cs.setResumeToken(null);
-					try {
-						mongoTemplate.getCollection(changeStreamProperties.getResumeTokenCollection()).deleteOne(
-								Filters.and(Filters.eq(CSID_FIELD, csId),
-										Filters.eq(HOST_FIELD, changeStreamProperties.getHostname())));
-					} catch (RuntimeException cleanup) {
-						this.logger.warn("Unable to delete lost checkpoint of " + csId, cleanup);
-					}
 				} else {
 					this.logger.error("Change stream '" + csId + "' stopped due to unexpected error:", e);
 				}
@@ -463,6 +460,40 @@ public class ChangeStreamService<T> {
 			}
 			return null;
 		}, watchExecutor);
+	}
+
+	/**
+	 * Whether the error means the stream can never be resumed from the current
+	 * resume token: the token fell out of the oplog window
+	 * ({@code ChangeStreamHistoryLost}), or it is not part of the stream's
+	 * token series ({@code ChangeStreamFatalError}, e.g. checkpoints written
+	 * by a differently partitioned AUTO_SCALE pipeline). Recovery is to
+	 * discard the checkpoint and restart from now (at-most-once for the lost
+	 * window).
+	 */
+	private static boolean isNonResumable(RuntimeException e) {
+		if (!(e instanceof MongoException mongoException))
+			return false;
+		return mongoException.hasErrorLabel("NonResumableChangeStreamError")
+				|| mongoException.getCode() == 280 // ChangeStreamFatalError
+				|| mongoException.getCode() == 286; // ChangeStreamHistoryLost
+	}
+
+	/**
+	 * Deletes every checkpoint of the stream carrying the poisoned token,
+	 * regardless of the host that wrote it: resume selection may pick another
+	 * host's checkpoint (AUTO_RECOVER highest term, AUTO_SCALE/BOARDCAST
+	 * fallback oldest), so deleting only our own document could resume from
+	 * the same invalid token forever. If other stale checkpoints remain, each
+	 * restart discards one more until the stream converges.
+	 */
+	private void discardCheckpoints(String csId, String token) {
+		try {
+			mongoTemplate.getCollection(changeStreamProperties.getResumeTokenCollection()).deleteMany(
+					Filters.and(Filters.eq(CSID_FIELD, csId), Filters.eq(TOKEN_FIELD, token)));
+		} catch (RuntimeException cleanup) {
+			this.logger.warn("Unable to delete invalid checkpoint of " + csId, cleanup);
+		}
 	}
 
 	/** Stops the local watch loop without touching the coordination state. */

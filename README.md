@@ -253,6 +253,17 @@ cycle.
 - Save resume token at regular time intervals
 - Configurable via `saveTokenInterval`
 
+### Invalid token recovery
+
+When a stream cannot resume from a stored checkpoint — the token fell out of
+the oplog window (`ChangeStreamHistoryLost`, 286) or is not part of the
+stream's token series (`ChangeStreamFatalError`, 280 /
+`NonResumableChangeStreamError`, e.g. checkpoints written by a differently
+partitioned AUTO_SCALE pipeline) — the poisoned checkpoint is deleted (across
+all hosts) and the stream is automatically restarted without it. Events that
+occurred while the token was unusable may be skipped (at-most-once for the
+lost window).
+
 ## Instance Management
 
 For AUTO_RECOVER and AUTO_SCALE modes, instance liveness comes from heartbeats
