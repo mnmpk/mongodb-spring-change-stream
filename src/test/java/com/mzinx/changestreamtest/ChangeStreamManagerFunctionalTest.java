@@ -15,6 +15,7 @@ import java.util.UUID;
 import java.util.function.BooleanSupplier;
 
 import org.bson.Document;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
@@ -58,7 +59,12 @@ import com.mzinx.mongodb.changestream.service.ChangeStreamConfigService;
 class ChangeStreamManagerFunctionalTest {
 
     static final String CONNECTION_STRING_ENV = "MONGODB_URI";
-    static final String DATABASE = "change_stream_functional_test";
+    /**
+     * Unique per-run database so concurrent workflow runs (e.g. CI and a
+     * release gate) can never interfere with each other on the shared test
+     * cluster. Dropped again after the run.
+     */
+    static final String DATABASE = "cs_func_test_" + UUID.randomUUID().toString().substring(0, 8);
 
     private static final String COORDINATION_STREAM_ID = "change-stream";
     private static final String CONFIG_STREAM_ID = "orders-functional-stream";
@@ -128,6 +134,14 @@ class ChangeStreamManagerFunctionalTest {
      */
     @BeforeAll
     static void cleanDatabase() {
+        try (MongoClient client = MongoClients.create(testDatabaseUri())) {
+            client.getDatabase(DATABASE).drop();
+        }
+    }
+
+    /** Drops the per-run database so test runs leave nothing behind. */
+    @AfterAll
+    static void dropDatabase() {
         try (MongoClient client = MongoClients.create(testDatabaseUri())) {
             client.getDatabase(DATABASE).drop();
         }
