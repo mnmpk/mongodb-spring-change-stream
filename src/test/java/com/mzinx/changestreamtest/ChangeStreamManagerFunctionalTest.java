@@ -84,14 +84,29 @@ class ChangeStreamManagerFunctionalTest {
     private TestRecordingListener testChangeStreamListener;
 
     /**
-     * Resolves the Atlas connection string from the {@value #CONNECTION_STRING_ENV}
-     * environment variable, skipping the tests when it is not set.
+     * Builds a connection string pointing at the test database from the
+     * {@value #CONNECTION_STRING_ENV} environment variable, skipping the tests
+     * when it is not set. Tolerates connection strings that already carry a
+     * database and/or query options (e.g.
+     * {@code mongodb+srv://user:pass@host/mydb?retryWrites=true}): the
+     * database path is replaced with {@value #DATABASE} and the options are
+     * preserved.
      */
-    private static String connectionString() {
-        String connectionString = System.getenv(CONNECTION_STRING_ENV);
-        assumeTrue(connectionString != null && !connectionString.isBlank(),
+    private static String testDatabaseUri() {
+        String raw = System.getenv(CONNECTION_STRING_ENV);
+        assumeTrue(raw != null && !raw.isBlank(),
                 "Skipping functional tests: " + CONNECTION_STRING_ENV + " environment variable is not set");
-        return connectionString.endsWith("/") ? connectionString : connectionString + "/";
+        String scheme = raw.startsWith("mongodb+srv://") ? "mongodb+srv://" : "mongodb://";
+        String rest = raw.substring(scheme.length());
+        String query = "";
+        int questionMark = rest.indexOf('?');
+        if (questionMark >= 0) {
+            query = rest.substring(questionMark);
+            rest = rest.substring(0, questionMark);
+        }
+        int slash = rest.indexOf('/');
+        String authority = slash >= 0 ? rest.substring(0, slash) : rest; // drop any database in the URI
+        return scheme + authority + "/" + DATABASE + query;
     }
 
     /**
@@ -100,7 +115,7 @@ class ChangeStreamManagerFunctionalTest {
      */
     @DynamicPropertySource
     static void mongoUri(DynamicPropertyRegistry registry) {
-        String uri = connectionString() + DATABASE;
+        String uri = testDatabaseUri();
         // Spring Boot 4 property prefix
         registry.add("spring.mongodb.uri", () -> uri);
         // pre-Boot-4 property prefix, kept for compatibility
@@ -113,7 +128,7 @@ class ChangeStreamManagerFunctionalTest {
      */
     @BeforeAll
     static void cleanDatabase() {
-        try (MongoClient client = MongoClients.create(connectionString() + DATABASE)) {
+        try (MongoClient client = MongoClients.create(testDatabaseUri())) {
             client.getDatabase(DATABASE).drop();
         }
     }
