@@ -21,7 +21,7 @@ import com.mzinx.mongodb.changestream.listener.ChangeStreamListener;
 import com.mzinx.mongodb.changestream.model.ChangeStream;
 import com.mzinx.mongodb.changestream.model.ChangeStream.Mode;
 import com.mzinx.mongodb.changestream.model.ChangeStreamConfig;
-import com.mzinx.mongodb.changestream.model.ChangeStreamRegistry;
+import com.mzinx.mongodb.changestream.model.ChangeStreamRuntime;
 import com.mzinx.mongodb.changestream.model.ChangeStreamStatus;
 import com.mzinx.mongodb.changestream.service.ChangeStreamConfigService;
 import com.mzinx.mongodb.changestream.service.ChangeStreamCoordinator;
@@ -43,7 +43,7 @@ import jakarta.annotation.PreDestroy;
  * <li><b>refresh</b> — reconciles persisted {@link ChangeStreamConfig}s:
  * starts new enabled configs, restarts changed definitions, stops disabled or
  * removed ones.</li>
- * <li><b>reconcileAll</b> — synchronizes every local registry from its
+ * <li><b>reconcileAll</b> — synchronizes every local runtime from its
  * coordination document (the single source of truth) and starts/stops/
  * repartitions the local watch loops per mode.</li>
  * <li><b>orphan cleanup</b> — deletes coordination documents that no config
@@ -55,7 +55,7 @@ import jakarta.annotation.PreDestroy;
  */
 @Component
 public class ChangeStreamManager {
-    Logger logger = LoggerFactory.getLogger(getClass());
+    private final Logger logger = LoggerFactory.getLogger(getClass());
 
     private static final String COORDINATION_STREAM_ID = "change-stream";
 
@@ -66,29 +66,29 @@ public class ChangeStreamManager {
     private final ChangeStreamCoordinator coordinator;
 
     /**
-     * All change stream registries, keyed by change stream id. This is the shared
-     * registry map bean also populated by {@link ChangeStreamService} for streams
-     * started programmatically, so the manager oversees every registry, including
-     * the coordination stream. Config-driven registries carry the applied config
-     * in {@link ChangeStreamRegistry#getConfig()}.
+     * Shared registry of every change stream runtime on this instance, also
+     * populated by {@link ChangeStreamService} for streams started
+     * programmatically, so the manager oversees every runtime, including the
+     * coordination stream. Config-driven runtimes carry the applied config in
+     * {@link ChangeStreamRuntime#getConfig()}.
      */
-    private final Map<String, ChangeStreamRegistry<Document>> changeStreams;
+    private final ChangeStreamRegistry changeStreamRegistry;
 
-    private volatile boolean coordinating = false;
+    private volatile boolean coordinationStreamStarted = false;
 
     ChangeStreamManager(ApplicationContext context, ChangeStreamProperties changeStreamProperties,
             ChangeStreamService<Document> changeStreamService, ChangeStreamConfigService changeStreamConfigService,
-            ChangeStreamCoordinator coordinator, Map<String, ChangeStreamRegistry<Document>> changeStreams) {
+            ChangeStreamCoordinator coordinator, ChangeStreamRegistry changeStreamRegistry) {
         this.context = context;
         this.changeStreamProperties = changeStreamProperties;
         this.changeStreamService = changeStreamService;
         this.changeStreamConfigService = changeStreamConfigService;
         this.coordinator = coordinator;
-        this.changeStreams = changeStreams;
+        this.changeStreamRegistry = changeStreamRegistry;
     }
 
     @Scheduled(initialDelayString = "${change-stream.config-refresh-initial-delay:10000}", fixedDelayString = "${change-stream.config-refresh-interval:30000}")
-    void watch() {
+    void reconcileCycle() {
         this.coordinate();
         try {
             this.housekeeping();
@@ -114,23 +114,24 @@ public class ChangeStreamManager {
     /**
      * Starts the coordination change stream watching the change stream
      * coordination collection, so leader/instance changes are propagated to all
-     * nodes with low latency. Its registry is kept in the shared registry map
-     * like any other change stream and reconciled by the same loop.
+     * nodes with low latency. Its runtime is kept in the shared registry like
+     * any other change stream and reconciled by the same loop.
      */
     private void coordinate() {
-        if (this.coordinating)
+        if (this.coordinationStreamStarted)
             return;
         try {
-            ChangeStreamListener<Document> changeStreamWatch = this.resolveListener("changeStreamWatch");
-            ChangeStreamRegistry<Document> coordinationRegistry = ChangeStreamRegistry.<Document>builder()
-                    .collectionName(changeStreamProperties.getChangeStreamCollection())
-                    .listener(changeStreamWatch)
-                    .changeStream(ChangeStream.of(COORDINATION_STREAM_ID, Mode.BOARDCAST,
+            ChangeStreamListener<Document> coordinationChangeListener = this
+                    .resolveListener("coordinationChangeListener");
+            ChangeStreamRuntime<Document> coordinationRuntime = ChangeStreamRuntime.<Document>builder()
+                    .collectionName(changeStreamProperties.getCoordinationCollection())
+                    .listener(coordinationChangeListener)
+                    .changeStream(ChangeStream.of(COORDINATION_STREAM_ID, Mode.BROADCAST,
                             List.of(Aggregates.match(
                                     Filters.in("operationType", List.of("insert", "update", "delete"))))))
                     .build();
-            this.changeStreamService.start(coordinationRegistry);
-            this.coordinating = true;
+            this.changeStreamService.start(coordinationRuntime);
+            this.coordinationStreamStarted = true;
         } catch (RuntimeException e) {
             logger.error("Unable to start coordination change stream:", e);
         }
@@ -170,10 +171,10 @@ public class ChangeStreamManager {
                 continue;
             }
             known.add(config.getId());
-            ChangeStreamRegistry<Document> reg = this.changeStreams.get(config.getId());
-            // config on the registry is only set after a successful start, so a
-            // half-started registry is retried on the next refresh
-            ChangeStreamConfig current = reg == null ? null : reg.getConfig();
+            ChangeStreamRuntime<Document> runtime = this.changeStreamRegistry.get(config.getId());
+            // config on the runtime is only set after a successful start, so a
+            // half-started runtime is retried on the next refresh
+            ChangeStreamConfig current = runtime == null ? null : runtime.getConfig();
 
             if (!config.isEnabled()) {
                 if (current != null) {
@@ -193,10 +194,11 @@ public class ChangeStreamManager {
         }
 
         // stop change streams whose config was removed
-        for (Map.Entry<String, ChangeStreamRegistry<Document>> entry : Set.copyOf(this.changeStreams.entrySet())) {
-            if (entry.getValue().getConfig() != null && !known.contains(entry.getKey())) {
-                logger.info("Change stream config " + entry.getKey() + " removed, stopping");
-                this.stop(entry.getKey());
+        for (String streamId : this.changeStreamRegistry.ids()) {
+            ChangeStreamRuntime<Document> runtime = this.changeStreamRegistry.get(streamId);
+            if (runtime != null && runtime.getConfig() != null && !known.contains(streamId)) {
+                logger.info("Change stream config " + streamId + " removed, stopping");
+                this.stop(streamId);
             }
         }
         return known;
@@ -208,12 +210,12 @@ public class ChangeStreamManager {
      * serialized per stream inside {@link ChangeStreamService#reconcile}.
      */
     private void reconcileAll() {
-        for (ChangeStreamRegistry<Document> reg : List.copyOf(this.changeStreams.values())) {
+        for (ChangeStreamRuntime<Document> runtime : this.changeStreamRegistry.<Document>all()) {
             try {
-                this.changeStreamService.reconcile(reg);
+                this.changeStreamService.reconcile(runtime);
             } catch (RuntimeException e) {
                 logger.error("Unable to reconcile change stream "
-                        + reg.getChangeStream().getId() + ":", e);
+                        + runtime.getChangeStream().getId() + ":", e);
             }
         }
     }
@@ -227,7 +229,7 @@ public class ChangeStreamManager {
     private void cleanOrphans(Set<String> configIds) {
         Set<String> keep = new HashSet<>(configIds);
         keep.add(COORDINATION_STREAM_ID);
-        keep.addAll(this.changeStreams.keySet());
+        keep.addAll(this.changeStreamRegistry.ids());
         long removed = coordinator.deleteOrphans(keep);
         if (removed > 0)
             logger.info("Removed " + removed + " orphaned coordination document(s)");
@@ -236,28 +238,28 @@ public class ChangeStreamManager {
     private void start(ChangeStreamConfig config) {
         try {
             ChangeStreamListener<Document> listener = this.resolveListener(config.getListener());
-            ChangeStreamRegistry<Document> reg = ChangeStreamRegistry.<Document>builder()
+            ChangeStreamRuntime<Document> runtime = ChangeStreamRuntime.<Document>builder()
                     .collectionName(config.getCollectionName())
                     .listener(listener)
                     .changeStream(config.toChangeStream())
                     .build();
-            this.changeStreamService.start(reg);
-            reg.setConfig(config);
+            this.changeStreamService.start(runtime);
+            runtime.setConfig(config);
             logger.info("Change stream " + config.getId() + " initiated from config");
         } catch (RuntimeException e) {
             logger.error("Unable to start change stream from config " + config.getId() + ":", e);
         }
     }
 
-    private void stop(String csId) {
+    private void stop(String streamId) {
         // deregister from the map first, so reconcile requests queued by the
         // coordination events of the stop itself cannot resurrect the stream
-        ChangeStreamRegistry<Document> reg = this.changeStreams.remove(csId);
-        if (reg != null) {
+        ChangeStreamRuntime<Document> runtime = this.changeStreamRegistry.deregister(streamId);
+        if (runtime != null) {
             try {
-                this.changeStreamService.stop(reg, false);
+                this.changeStreamService.stop(runtime);
             } catch (RuntimeException e) {
-                logger.error("Unable to stop change stream " + csId + ":", e);
+                logger.error("Unable to stop change stream " + streamId + ":", e);
             }
         }
     }
@@ -268,7 +270,7 @@ public class ChangeStreamManager {
      * ones.
      */
     public List<ChangeStreamStatus> getChangeStreams() {
-        return this.changeStreams.values().stream().map(this::toStatus).toList();
+        return this.changeStreamRegistry.<Document>all().stream().map(this::toStatus).toList();
     }
 
     /**
@@ -276,8 +278,8 @@ public class ChangeStreamManager {
      * instance.
      */
     public List<ChangeStreamStatus> getActiveChangeStreams() {
-        return this.changeStreams.values().stream()
-                .filter(reg -> reg.getChangeStream() != null && reg.getChangeStream().isRunning())
+        return this.changeStreamRegistry.<Document>all().stream()
+                .filter(runtime -> runtime.getChangeStream() != null && runtime.getChangeStream().isRunning())
                 .map(this::toStatus)
                 .toList();
     }
@@ -285,28 +287,28 @@ public class ChangeStreamManager {
     /**
      * Returns the status of the change stream with the given id, if registered.
      */
-    public Optional<ChangeStreamStatus> getChangeStreamStatus(String csId) {
-        return Optional.ofNullable(this.changeStreams.get(csId)).map(this::toStatus);
+    public Optional<ChangeStreamStatus> getChangeStreamStatus(String streamId) {
+        return Optional.<ChangeStreamRuntime<Document>>ofNullable(this.changeStreamRegistry.get(streamId)).map(this::toStatus);
     }
 
-    private ChangeStreamStatus toStatus(ChangeStreamRegistry<Document> reg) {
-        ChangeStream<Document> cs = reg.getChangeStream();
+    private ChangeStreamStatus toStatus(ChangeStreamRuntime<Document> runtime) {
+        ChangeStream<Document> stream = runtime.getChangeStream();
         return ChangeStreamStatus.builder()
-                .id(cs.getId())
-                .collectionName(reg.getCollectionName())
-                .mode(cs.getMode())
-                .resumeStrategy(cs.getResumeStrategy())
-                .running(cs.isRunning())
-                .leader(reg.getLeader())
-                .leaseUntil(reg.getLeaseUntil())
-                .term(reg.getTerm())
-                .instances(reg.getInstances() == null ? List.of() : List.copyOf(reg.getInstances()))
-                .epoch(reg.getEpoch())
-                .instanceIndex(reg.getInstanceIndex())
-                .instanceSize(reg.getInstanceSize())
-                .resumeToken(cs.getResumeToken())
-                .listener(reg.getListener() == null ? null : reg.getListener().getClass().getSimpleName())
-                .managedByConfig(reg.getConfig() != null)
+                .id(stream.getId())
+                .collectionName(runtime.getCollectionName())
+                .mode(stream.getMode())
+                .resumeStrategy(stream.getResumeStrategy())
+                .running(stream.isRunning())
+                .leader(runtime.getLeader())
+                .leaseUntil(runtime.getLeaseUntil())
+                .term(runtime.getTerm())
+                .instances(runtime.getInstances() == null ? List.of() : List.copyOf(runtime.getInstances()))
+                .epoch(runtime.getEpoch())
+                .partitionIndex(runtime.getPartitionIndex())
+                .partitionCount(runtime.getPartitionCount())
+                .resumeToken(stream.getResumeToken())
+                .listener(runtime.getListener() == null ? null : runtime.getListener().getClass().getSimpleName())
+                .managedByConfig(runtime.getConfig() != null)
                 .build();
     }
 
@@ -323,11 +325,11 @@ public class ChangeStreamManager {
 
     @PreDestroy
     private void clear() {
-        for (ChangeStreamRegistry<Document> reg : this.changeStreams.values()) {
-            if (reg.getChangeStream() != null)
-                reg.getChangeStream().setRunning(false);
+        for (ChangeStreamRuntime<Document> runtime : this.changeStreamRegistry.<Document>all()) {
+            if (runtime.getChangeStream() != null)
+                runtime.getChangeStream().setRunning(false);
         }
-        this.coordinating = false;
+        this.coordinationStreamStarted = false;
     }
 
 }

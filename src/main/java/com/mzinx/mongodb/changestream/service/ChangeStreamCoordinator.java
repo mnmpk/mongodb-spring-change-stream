@@ -45,9 +45,9 @@ import com.mzinx.mongodb.changestream.model.ChangeStreamCoordination;
  */
 @Service
 public class ChangeStreamCoordinator {
-    Logger logger = LoggerFactory.getLogger(getClass());
+    private final Logger logger = LoggerFactory.getLogger(getClass());
 
-    private static final Date EPOCH_ZERO = new Date(0);
+    private static final Date UNIX_EPOCH = new Date(0);
 
     private final MongoTemplate mongoTemplate;
     private final ChangeStreamProperties properties;
@@ -58,7 +58,7 @@ public class ChangeStreamCoordinator {
     }
 
     private MongoCollection<Document> coordinationCollection() {
-        return mongoTemplate.getCollection(properties.getChangeStreamCollection());
+        return mongoTemplate.getCollection(properties.getCoordinationCollection());
     }
 
     private MongoCollection<Document> instanceCollection() {
@@ -76,7 +76,7 @@ public class ChangeStreamCoordinator {
      * to the lease shape. Returns the resulting coordination state, which
      * doubles as the database-to-memory synchronization read.
      */
-    public ChangeStreamCoordination join(String csId) {
+    public ChangeStreamCoordination join(String streamId) {
         Document alreadyMember = expr("$in", hostname(), "$_m");
         List<Bson> pipeline = List.of(
                 new Document("$set", new Document()
@@ -95,7 +95,7 @@ public class ChangeStreamCoordinator {
                         .append(DATE_FIELD, cond(alreadyMember, ifNull("$" + DATE_FIELD, "$$NOW"), "$$NOW"))),
                 new Document("$unset", List.of("_m", "_l")));
         return ChangeStreamCoordination.from(coordinationCollection().findOneAndUpdate(
-                Filters.eq("_id", csId), pipeline,
+                Filters.eq("_id", streamId), pipeline,
                 new FindOneAndUpdateOptions().upsert(true).returnDocument(ReturnDocument.AFTER)));
     }
 
@@ -106,14 +106,14 @@ public class ChangeStreamCoordinator {
      * pure renewal events and checkpoints can be fenced against zombie
      * leaders. Lease expiry is evaluated against {@code $$NOW} (server time).
      */
-    public ChangeStreamCoordination acquireOrRenewLease(String csId) {
+    public ChangeStreamCoordination acquireOrRenewLease(String streamId) {
         List<Bson> pipeline = List.of(
                 new Document("$set", new Document("_l", normalizedLease())),
                 new Document("$set", new Document()
                         .append("_mine", expr("$eq", ifNull("$_l." + LEADER_HOST_FIELD, null), hostname()))
                         .append("_open", expr("$or",
                                 expr("$eq", ifNull("$_l", null), null),
-                                expr("$lt", ifNull("$_l." + LEADER_UNTIL_FIELD, EPOCH_ZERO), "$$NOW")))),
+                                expr("$lt", ifNull("$_l." + LEADER_UNTIL_FIELD, UNIX_EPOCH), "$$NOW")))),
                 new Document("$set", new Document()
                         .append("_acq", expr("$or", "$_mine", "$_open"))
                         .append("_bump", expr("$and", expr("$not", "$_mine"), "$_open"))),
@@ -129,7 +129,7 @@ public class ChangeStreamCoordinator {
                         .append(DATE_FIELD, cond("$_bump", "$$NOW", ifNull("$" + DATE_FIELD, "$$NOW")))),
                 new Document("$unset", List.of("_l", "_mine", "_open", "_acq", "_bump")));
         return ChangeStreamCoordination.from(coordinationCollection().findOneAndUpdate(
-                Filters.eq("_id", csId), pipeline,
+                Filters.eq("_id", streamId), pipeline,
                 new FindOneAndUpdateOptions().upsert(true).returnDocument(ReturnDocument.AFTER)));
     }
 
@@ -139,7 +139,7 @@ public class ChangeStreamCoordinator {
      * holds it. Returns the resulting state, or {@code null} when no
      * coordination document exists.
      */
-    public ChangeStreamCoordination leave(String csId) {
+    public ChangeStreamCoordination leave(String streamId) {
         Document wasLeader = expr("$eq", ifNull("$_l." + LEADER_HOST_FIELD, null), hostname());
         Document membershipChanged = expr("$ne",
                 new Document("$size", "$" + MEMBERS_FIELD), new Document("$size", "$_m"));
@@ -162,7 +162,7 @@ public class ChangeStreamCoordinator {
                                 "$$NOW", ifNull("$" + DATE_FIELD, "$$NOW")))),
                 new Document("$unset", List.of("_m", "_l")));
         return ChangeStreamCoordination.from(coordinationCollection().findOneAndUpdate(
-                Filters.eq("_id", csId), pipeline,
+                Filters.eq("_id", streamId), pipeline,
                 new FindOneAndUpdateOptions().returnDocument(ReturnDocument.AFTER)));
     }
 
@@ -170,7 +170,7 @@ public class ChangeStreamCoordinator {
      * Clears the leader lease and the whole member list of the change stream,
      * bumping both term and epoch so every instance fences and re-evaluates.
      */
-    public ChangeStreamCoordination reset(String csId) {
+    public ChangeStreamCoordination reset(String streamId) {
         List<Bson> pipeline = List.of(
                 new Document("$set", new Document()
                         .append(LEADER_FIELD, null)
@@ -179,7 +179,7 @@ public class ChangeStreamCoordinator {
                         .append(EPOCH_FIELD, expr("$add", ifNull("$" + EPOCH_FIELD, 0L), 1L))
                         .append(DATE_FIELD, "$$NOW")));
         return ChangeStreamCoordination.from(coordinationCollection().findOneAndUpdate(
-                Filters.eq("_id", csId), pipeline,
+                Filters.eq("_id", streamId), pipeline,
                 new FindOneAndUpdateOptions().upsert(true).returnDocument(ReturnDocument.AFTER)));
     }
 
@@ -210,7 +210,7 @@ public class ChangeStreamCoordinator {
                                 expr("$or",
                                         expr("$eq", ifNull("$_l", null), null),
                                         expr("$not", expr("$in", ifNull("$_l." + LEADER_HOST_FIELD, null), alive)),
-                                        expr("$lt", ifNull("$_l." + LEADER_UNTIL_FIELD, EPOCH_ZERO), "$$NOW")),
+                                        expr("$lt", ifNull("$_l." + LEADER_UNTIL_FIELD, UNIX_EPOCH), "$$NOW")),
                                 null,
                                 "$_l"))),
                 new Document("$set", new Document()
@@ -232,8 +232,8 @@ public class ChangeStreamCoordinator {
     }
 
     /** Loads the coordination document of a change stream, or {@code null}. */
-    public ChangeStreamCoordination find(String csId) {
-        return ChangeStreamCoordination.from(coordinationCollection().find(Filters.eq("_id", csId)).first());
+    public ChangeStreamCoordination find(String streamId) {
+        return ChangeStreamCoordination.from(coordinationCollection().find(Filters.eq("_id", streamId)).first());
     }
 
     /**
@@ -257,7 +257,7 @@ public class ChangeStreamCoordinator {
      * and produces the delete events the fast reconcile path reacts to.
      */
     public long sweepDeadInstances() {
-        Date cutoff = new Date(System.currentTimeMillis() - properties.getMaxTimeout());
+        Date cutoff = new Date(System.currentTimeMillis() - properties.getInstanceLivenessTimeout());
         return instanceCollection().deleteMany(Filters.lt(DATE_FIELD, cutoff)).getDeletedCount();
     }
 
@@ -270,7 +270,7 @@ public class ChangeStreamCoordinator {
     public List<String> aliveInstances() {
         if (instanceCollection().countDocuments() == 0)
             return List.of();
-        Date cutoff = new Date(System.currentTimeMillis() - properties.getMaxTimeout());
+        Date cutoff = new Date(System.currentTimeMillis() - properties.getInstanceLivenessTimeout());
         List<String> alive = new ArrayList<>();
         instanceCollection().find(Filters.gte(DATE_FIELD, cutoff))
                 .projection(Projections.include("_id"))

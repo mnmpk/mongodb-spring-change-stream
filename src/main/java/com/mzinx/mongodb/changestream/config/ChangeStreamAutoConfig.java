@@ -1,11 +1,5 @@
 package com.mzinx.mongodb.changestream.config;
 
-import java.util.Collections;
-import java.util.LinkedHashSet;
-import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
@@ -14,23 +8,26 @@ import org.springframework.context.annotation.ComponentScan;
 import org.springframework.context.annotation.Import;
 import org.springframework.scheduling.annotation.EnableScheduling;
 
-import com.mzinx.mongodb.changestream.model.ChangeStreamRegistry;
+import com.mzinx.mongodb.changestream.ChangeStreamRegistry;
+import com.mzinx.mongodb.changestream.InstanceRegistry;
 
 @AutoConfiguration
 @EnableConfigurationProperties(ChangeStreamProperties.class)
 @ConditionalOnProperty(prefix = "change-stream", name = "enabled", havingValue = "true", matchIfMissing = true)
 @ComponentScan("com.mzinx.mongodb.changestream")
 @EnableScheduling
-@Import(ScanRegistrar.class)
+@Import(AutoConfigurationPackageRegistrar.class)
 public class ChangeStreamAutoConfig {
 
+    /** Registry of every change stream runtime on this instance. */
     @Bean
-    Map<String, ChangeStreamRegistry<?>> changeStreams() {
-        return new ConcurrentHashMap<>();
+    ChangeStreamRegistry changeStreamRegistry() {
+        return new ChangeStreamRegistry();
     }
 
+    /** Registry of the live instances, populated by the discovery module. */
     @Bean
-    Set<String> instances() {
-        return Collections.synchronizedSet(new LinkedHashSet<>());
+    InstanceRegistry instanceRegistry() {
+        return new InstanceRegistry();
     }
 }

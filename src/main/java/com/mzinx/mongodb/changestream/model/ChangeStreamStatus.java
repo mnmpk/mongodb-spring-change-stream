@@ -52,10 +52,10 @@ public class ChangeStreamStatus {
     private long epoch;
 
     /** Index of this instance among the cluster instances (AUTO_SCALE). */
-    private int instanceIndex;
+    private int partitionIndex;
 
     /** Number of cluster instances sharing the stream (AUTO_SCALE). */
-    private int instanceSize;
+    private int partitionCount;
 
     /** Last resume token applied to the stream, if any. */
     private String resumeToken;

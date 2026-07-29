@@ -22,7 +22,7 @@ import com.mzinx.mongodb.changestream.model.ChangeStreamConfig;
  */
 @Service
 public class ChangeStreamConfigService {
-    Logger logger = LoggerFactory.getLogger(getClass());
+    private final Logger logger = LoggerFactory.getLogger(getClass());
 
     private final MongoTemplate mongoTemplate;
     private final ChangeStreamProperties changeStreamProperties;

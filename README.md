@@ -21,7 +21,7 @@ Add the following dependency to your `pom.xml`:
 <dependency>
     <groupId>com.mzinx</groupId>
     <artifactId>mongodb-spring-change-stream</artifactId>
-    <version>0.0.3</version>
+    <version>1.0.0</version>
 </dependency>
 ```
 
@@ -31,7 +31,7 @@ Also add the aggregation dependency for pipeline support:
 <dependency>
     <groupId>com.mzinx</groupId>
     <artifactId>mongodb-spring-aggregation</artifactId>
-    <version>0.0.3</version>
+    <version>1.0.0</version>
 </dependency>
 ```
 
@@ -59,7 +59,7 @@ change-stream.tokenMaxLifeTime=86400000
 # heartbeat in the instance collection is older than this are swept and
 # repaired out of every coordination document. Align it with
 # discovery.heartbeat.interval * discovery.heartbeat.max.
-change-stream.maxTimeout=50000
+change-stream.instanceLivenessTimeout=50000
 
 # Leader lease duration in milliseconds for AUTO_RECOVER mode (default: 90000).
 # The lease is renewed on every reconcile cycle, so keep it a small multiple of
@@ -73,7 +73,7 @@ change-stream.resumeTokenCollection=_resumeTokens
 change-stream.instanceCollection=_instances
 
 # Collection name for change stream coordination documents (default: _changeStreams)
-change-stream.changeStreamCollection=_changeStreams
+change-stream.coordinationCollection=_changeStreams
 
 # Collection name for storing change stream configs (default: _changeStreamConfigs)
 change-stream.changeStreamConfigCollection=_changeStreamConfigs
@@ -104,8 +104,8 @@ private ChangeStreamConfigService changeStreamConfigService;
 changeStreamConfigService.save(ChangeStreamConfig.builder()
     .id("orders-stream")                 // unique change stream id
     .collectionName("orders")            // collection to watch (null = whole database)
-    .mode(Mode.BOARDCAST)                // BOARDCAST, AUTO_RECOVER or AUTO_SCALE
-    .resumeStrategy(ResumeStrategy.BATCH)
+    .mode(Mode.BROADCAST)                // BROADCAST, AUTO_RECOVER or AUTO_SCALE
+    .resumeStrategy(ResumeStrategy.PER_BATCH)
     .pipeline(List.of(new Document("$match",
         new Document("operationType", new Document("$in", List.of("insert", "update"))))))
     .listener("orderListener")           // ChangeStreamListener bean name
@@ -119,7 +119,7 @@ The `listener` field references a Spring bean implementing `ChangeStreamListener
 @Component("orderListener")
 public class OrderListener implements ChangeStreamListener<Document> {
     @Override
-    public void execute(ChangeStreamDocument<Document> event) {
+    public void onEvent(ChangeStreamDocument<Document> event) {
         System.out.println("Change detected: " + event.getOperationType());
     }
 }
@@ -137,24 +137,26 @@ like config-driven ones:
 @Autowired
 private ChangeStreamService<Document> changeStreamService;
 
-ChangeStreamRegistry<Document> registry = ChangeStreamRegistry.<Document>builder()
+ChangeStreamRuntime<Document> runtime = ChangeStreamRuntime.<Document>builder()
     .collectionName("orders")            // null = whole database
     .listener(event -> System.out.println("Change detected: " + event.getOperationType()))
     .changeStream(ChangeStream.of("orders-stream", Mode.AUTO_RECOVER)
-        .resumeStrategy(ResumeStrategy.TIME, 30000)
+        .resumeStrategy(ResumeStrategy.INTERVAL, 30000)
         .fullDocument(FullDocument.UPDATE_LOOKUP))
     .build();
 
-changeStreamService.start(registry);
+changeStreamService.start(runtime);
 
 // stop locally and deregister this host from the coordination document
-changeStreamService.stop(registry, false);
+changeStreamService.stop(runtime);
+// or stop the stream on every instance
+changeStreamService.stopAllInstances(runtime);
 ```
 
 ### Monitoring Change Streams
 
-`ChangeStreamManager` exposes a read-only status API covering every registry
-(the coordination stream, config-driven and programmatic streams):
+`ChangeStreamManager` exposes a read-only status API covering every registered
+stream (the coordination stream, config-driven and programmatic streams):
 
 ```java
 @Autowired
@@ -167,7 +169,7 @@ List<ChangeStreamStatus> all = changeStreamManager.getChangeStreams();
 List<ChangeStreamStatus> active = changeStreamManager.getActiveChangeStreams();
 
 // a specific stream: running flag, leader, lease expiry, fencing term,
-// members, membership epoch, partition index/size, resume token, listener
+// members, membership epoch, partition index/count, resume token, listener
 Optional<ChangeStreamStatus> status = changeStreamManager.getChangeStreamStatus("orders-stream");
 ```
 
@@ -200,7 +202,7 @@ Optional<ChangeStreamStatus> status = changeStreamManager.getChangeStreamStatus(
 ## Coordination and Reconciliation
 
 The distributed state of every change stream lives in a single coordination
-document (collection `change-stream.changeStreamCollection`, default
+document (collection `change-stream.coordinationCollection`, default
 `_changeStreams`) — the single source of truth:
 
 ```javascript
@@ -226,7 +228,7 @@ Every instance runs a periodic reconcile loop
 1. sweeps dead instance heartbeats and atomically repairs every coordination
    document (removes dead members, releases dead/expired leases)
 2. reconciles the persisted change stream configs (start/restart/stop)
-3. synchronizes each local registry from its coordination document and
+3. synchronizes each local runtime from its coordination document and
    starts, stops or repartitions the local watch loops per mode
 4. deletes orphaned coordination documents
 
@@ -241,26 +243,31 @@ cycle.
 - No resume token management
 - Change streams start from current position on restart
 
-### EVERY
+### PER_EVENT
 - Save resume token after every event
 - Maximum reliability but higher overhead
 
-### BATCH
+### PER_BATCH
 - Save resume token after processing each batch
 - Balances reliability and performance
 
-### TIME
+### INTERVAL
 - Save resume token at regular time intervals
-- Configurable via `saveTokenInterval`
+- Configurable via `checkpointInterval`
 
 ### Invalid token recovery
 
-When a stream cannot resume from a stored checkpoint — the token fell out of
-the oplog window (`ChangeStreamHistoryLost`, 286) or is not part of the
+Checkpoints are applied with the driver's `startAfter`, so a stream resumes
+across an invalidate notification (e.g. the watched collection or database
+was dropped and recreated) instead of failing.
+
+When a stream still cannot resume from a stored checkpoint — the token fell
+out of the oplog window (`ChangeStreamHistoryLost`, 286), is not part of the
 stream's token series (`ChangeStreamFatalError`, 280 /
 `NonResumableChangeStreamError`, e.g. checkpoints written by a differently
-partitioned AUTO_SCALE pipeline) — the poisoned checkpoint is deleted (across
-all hosts) and the stream is automatically restarted without it. Events that
+partitioned AUTO_SCALE pipeline), or is rejected outright
+(`InvalidResumeToken`, 260) — the poisoned checkpoint is deleted (across all
+hosts) and the stream is automatically restarted without it. Events that
 occurred while the token was unusable may be skipped (at-most-once for the
 lost window).
 

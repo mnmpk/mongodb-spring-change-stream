@@ -20,7 +20,7 @@ public class ChangeStreamProperties {
      * repaired out of every coordination document. Should be aligned with
      * {@code discovery.heartbeat.interval * discovery.heartbeat.max}.
      */
-    private long maxTimeout = 5000*10; // ms
+    private long instanceLivenessTimeout = 5000 * 10; // ms
     /**
      * Leader lease duration in ms (AUTO_RECOVER mode). The lease is renewed on
      * every reconcile cycle, so it should be a small multiple of
@@ -30,7 +30,8 @@ public class ChangeStreamProperties {
     private long leaseDuration = 90000; // ms
     private String resumeTokenCollection = "_resumeTokens";
     private String instanceCollection = "_instances";
-    private String changeStreamCollection = "_changeStreams";
+    /** Collection holding the change stream coordination documents. */
+    private String coordinationCollection = "_changeStreams";
     private String changeStreamConfigCollection = "_changeStreamConfigs";
     private long configRefreshInitialDelay = 10000; // ms
     private long configRefreshInterval = 30000; // ms

@@ -33,7 +33,7 @@ import lombok.NoArgsConstructor;
 @AllArgsConstructor
 public class ChangeStreamConfig {
 
-    private static final Long DEFAULT_SAVE_TOKEN_INTERVAL = 60 * 1000l;
+    private static final Long DEFAULT_CHECKPOINT_INTERVAL = 60 * 1000l;
 
     /** Unique change stream id. */
     @Id
@@ -42,9 +42,9 @@ public class ChangeStreamConfig {
     /** Collection to watch. When {@code null}, the whole database is watched. */
     private String collectionName;
 
-    /** Coordination mode. Defaults to {@link Mode#BOARDCAST}. */
+    /** Coordination mode. Defaults to {@link Mode#BROADCAST}. */
     @Builder.Default
-    private Mode mode = Mode.BOARDCAST;
+    private Mode mode = Mode.BROADCAST;
 
     private Integer batchSize;
 
@@ -55,8 +55,8 @@ public class ChangeStreamConfig {
     @Builder.Default
     private ResumeStrategy resumeStrategy = ResumeStrategy.NONE;
 
-    /** Interval in milliseconds for {@link ResumeStrategy#TIME} checkpointing. */
-    private Long saveTokenInterval;
+    /** Interval in milliseconds for {@link ResumeStrategy#INTERVAL} checkpointing. */
+    private Long checkpointInterval;
 
     private FullDocument fullDocument;
 
@@ -84,11 +84,11 @@ public class ChangeStreamConfig {
     public ChangeStream<Document> toChangeStream() {
         List<Bson> stages = this.pipeline == null ? List.of() : new ArrayList<>(this.pipeline);
         return new ChangeStream<>(this.id,
-                this.mode == null ? Mode.BOARDCAST : this.mode,
+                this.mode == null ? Mode.BROADCAST : this.mode,
                 this.batchSize,
                 this.maxAwaitTime,
                 this.resumeStrategy == null ? ResumeStrategy.NONE : this.resumeStrategy,
-                this.saveTokenInterval == null ? DEFAULT_SAVE_TOKEN_INTERVAL : this.saveTokenInterval,
+                this.checkpointInterval == null ? DEFAULT_CHECKPOINT_INTERVAL : this.checkpointInterval,
                 this.fullDocumentBeforeChange,
                 this.fullDocument,
                 stages,
@@ -108,7 +108,7 @@ public class ChangeStreamConfig {
                 && Objects.equals(this.batchSize, other.batchSize)
                 && Objects.equals(this.maxAwaitTime, other.maxAwaitTime)
                 && this.resumeStrategy == other.resumeStrategy
-                && Objects.equals(this.saveTokenInterval, other.saveTokenInterval)
+                && Objects.equals(this.checkpointInterval, other.checkpointInterval)
                 && this.fullDocument == other.fullDocument
                 && this.fullDocumentBeforeChange == other.fullDocumentBeforeChange
                 && Objects.equals(this.pipeline, other.pipeline)

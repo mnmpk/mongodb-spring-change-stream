@@ -37,12 +37,13 @@ import com.mongodb.client.model.Sorts;
 import com.mongodb.client.model.UpdateOptions;
 import com.mongodb.client.model.Updates;
 import com.mongodb.client.model.changestream.ChangeStreamDocument;
+import com.mzinx.mongodb.changestream.ChangeStreamRegistry;
 import com.mzinx.mongodb.changestream.config.ChangeStreamProperties;
 import com.mzinx.mongodb.changestream.model.ChangeStream;
 import com.mzinx.mongodb.changestream.model.ChangeStream.Mode;
 import com.mzinx.mongodb.changestream.model.ChangeStream.ResumeStrategy;
 import com.mzinx.mongodb.changestream.model.ChangeStreamCoordination;
-import com.mzinx.mongodb.changestream.model.ChangeStreamRegistry;
+import com.mzinx.mongodb.changestream.model.ChangeStreamRuntime;
 
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -56,7 +57,7 @@ import jakarta.annotation.PreDestroy;
  * <li><b>The coordination document is the single source of truth.</b> All
  * distributed decisions (who runs, who leads, how the stream is partitioned)
  * are derived from the document returned by the atomic updates in
- * {@link ChangeStreamCoordinator}; the in-memory registry only caches it.</li>
+ * {@link ChangeStreamCoordinator}; the in-memory runtime only caches it.</li>
  * <li><b>Reconciliation, not choreography.</b> {@link #reconcile} is an
  * idempotent desired-state convergence step. It is executed periodically by
  * the manager (authoritative) and eagerly on coordination events
@@ -71,7 +72,7 @@ import jakarta.annotation.PreDestroy;
  * </ul>
  * Modes:
  * <ul>
- * <li>{@link Mode#BOARDCAST} — every registered member runs the full stream;
+ * <li>{@link Mode#BROADCAST} — every registered member runs the full stream;
  * no leader is needed or elected.</li>
  * <li>{@link Mode#AUTO_RECOVER} — exactly one instance runs the stream: the
  * holder of the leader lease. Failover happens when the lease expires or the
@@ -85,7 +86,7 @@ import jakarta.annotation.PreDestroy;
  */
 @Service
 public class ChangeStreamService<T> {
-	Logger logger = LoggerFactory.getLogger(getClass());
+	private final Logger logger = LoggerFactory.getLogger(getClass());
 	private static final String INDEX_NAME = "ttl";
 	private static final String CSID_FIELD = "_id.cs";
 	private static final String HOST_FIELD = "_id.h";
@@ -103,7 +104,7 @@ public class ChangeStreamService<T> {
 	private Executor taskExecutor;
 
 	@Autowired
-	private Map<String, ChangeStreamRegistry<T>> changeStreams;
+	private ChangeStreamRegistry changeStreamRegistry;
 
 	@Autowired
 	private ChangeStreamCoordinator coordinator;
@@ -183,14 +184,14 @@ public class ChangeStreamService<T> {
 
 	@PreDestroy
 	private void destroy() {
-		for (String csId : Set.copyOf(changeStreams.keySet())) {
-			ChangeStreamRegistry<T> reg = changeStreams.remove(csId);
-			if (reg == null)
+		for (String streamId : changeStreamRegistry.ids()) {
+			ChangeStreamRuntime<T> runtime = changeStreamRegistry.deregister(streamId);
+			if (runtime == null)
 				continue;
 			try {
-				this.stop(reg, false);
+				this.stop(runtime);
 			} catch (RuntimeException e) {
-				logger.error("Error stopping change stream " + csId + " on shutdown:", e);
+				logger.error("Error stopping change stream " + streamId + " on shutdown:", e);
 			}
 		}
 		this.clear();
@@ -204,28 +205,39 @@ public class ChangeStreamService<T> {
 	 * lease when applicable and starting the local watch loop if this host
 	 * should run it).
 	 */
-	public void start(ChangeStreamRegistry<T> reg) {
-		this.logger.info("Start change stream: " + reg.getChangeStream().getId());
-		this.changeStreams.put(reg.getChangeStream().getId(), reg);
-		this.reconcile(reg);
+	public void start(ChangeStreamRuntime<T> runtime) {
+		this.logger.info("Start change stream: " + runtime.getChangeStream().getId());
+		this.changeStreamRegistry.register(runtime.getChangeStream().getId(), runtime);
+		this.reconcile(runtime);
 	}
 
 	/**
 	 * Stops the local watch loop and deregisters this host from the
-	 * coordination document ({@code stopAll = false}), or clears the whole
-	 * coordination state so every instance stops ({@code stopAll = true}).
+	 * coordination document; other instances keep running the stream.
 	 */
-	public void stop(ChangeStreamRegistry<T> reg, boolean stopAll) {
-		String csId = reg.getChangeStream().getId();
-		this.logger.info("Stop change stream: " + csId);
-		ReentrantLock lock = lockFor(csId);
+	public void stop(ChangeStreamRuntime<T> runtime) {
+		this.doStop(runtime, false);
+	}
+
+	/**
+	 * Stops the local watch loop and clears the whole coordination state, so
+	 * every instance running this change stream stops on its next reconcile.
+	 */
+	public void stopAllInstances(ChangeStreamRuntime<T> runtime) {
+		this.doStop(runtime, true);
+	}
+
+	private void doStop(ChangeStreamRuntime<T> runtime, boolean stopAll) {
+		String streamId = runtime.getChangeStream().getId();
+		this.logger.info("Stop change stream: " + streamId);
+		ReentrantLock lock = lockFor(streamId);
 		lock.lock();
 		try {
-			this.stopLocal(reg);
+			this.stopLocal(runtime);
 			if (stopAll)
-				coordinator.reset(csId);
+				coordinator.reset(streamId);
 			else
-				coordinator.leave(csId);
+				coordinator.leave(streamId);
 		} finally {
 			lock.unlock();
 		}
@@ -233,23 +245,23 @@ public class ChangeStreamService<T> {
 
 	/**
 	 * Converges the local state of the change stream to the coordination
-	 * document (single source of truth): synchronizes the registry cache from
+	 * document (single source of truth): synchronizes the runtime cache from
 	 * the database, then starts, stops or repartitions the local watch loop as
 	 * required by the mode. Idempotent; safe to call from the periodic loop
 	 * and from event triggers concurrently (transitions are serialized by a
 	 * per-stream lock). Errors are logged and healed by the next cycle.
 	 */
-	public void reconcile(ChangeStreamRegistry<T> reg) {
-		String csId = reg.getChangeStream().getId();
-		ReentrantLock lock = lockFor(csId);
+	public void reconcile(ChangeStreamRuntime<T> runtime) {
+		String streamId = runtime.getChangeStream().getId();
+		ReentrantLock lock = lockFor(streamId);
 		lock.lock();
 		try {
 			// skip registries that were deregistered while this task was queued
-			if (this.changeStreams.get(csId) != reg)
+			if (this.changeStreamRegistry.<T>get(streamId) != runtime)
 				return;
-			this.doReconcile(reg);
+			this.doReconcile(runtime);
 		} catch (RuntimeException e) {
-			logger.error("Unable to reconcile change stream " + csId + " (will retry on next cycle):", e);
+			logger.error("Unable to reconcile change stream " + streamId + " (will retry on next cycle):", e);
 		} finally {
 			lock.unlock();
 		}
@@ -259,51 +271,51 @@ public class ChangeStreamService<T> {
 	 * Asynchronously reconciles the registered change stream, used by event
 	 * listeners as a low-latency nudge without blocking the event loop.
 	 */
-	public void requestReconcile(String csId) {
-		ChangeStreamRegistry<T> reg = this.changeStreams.get(csId);
-		if (reg == null)
+	public void requestReconcile(String streamId) {
+		ChangeStreamRuntime<T> runtime = this.changeStreamRegistry.get(streamId);
+		if (runtime == null)
 			return;
 		try {
-			CompletableFuture.runAsync(() -> this.reconcile(reg), taskExecutor);
+			CompletableFuture.runAsync(() -> this.reconcile(runtime), taskExecutor);
 		} catch (RuntimeException e) {
-			logger.debug("Unable to schedule reconcile for " + csId, e);
+			logger.debug("Unable to schedule reconcile for " + streamId, e);
 		}
 	}
 
 	/** Asynchronously reconciles every registered change stream. */
 	public void requestReconcileAll() {
-		this.changeStreams.keySet().forEach(this::requestReconcile);
+		this.changeStreamRegistry.ids().forEach(this::requestReconcile);
 	}
 
-	private void doReconcile(ChangeStreamRegistry<T> reg) {
-		ChangeStream<T> cs = reg.getChangeStream();
-		String csId = cs.getId();
+	private void doReconcile(ChangeStreamRuntime<T> runtime) {
+		ChangeStream<T> stream = runtime.getChangeStream();
+		String streamId = stream.getId();
 		String hostname = changeStreamProperties.getHostname();
 
 		// membership registration doubles as the DB -> memory synchronization
 		// read: the returned document is the authoritative state
-		ChangeStreamCoordination coordination = coordinator.join(csId);
-		if (Mode.AUTO_RECOVER == cs.getMode())
-			coordination = coordinator.acquireOrRenewLease(csId);
-		this.apply(reg, coordination);
+		ChangeStreamCoordination coordination = coordinator.join(streamId);
+		if (Mode.AUTO_RECOVER == stream.getMode())
+			coordination = coordinator.acquireOrRenewLease(streamId);
+		this.apply(runtime, coordination);
 
-		switch (cs.getMode()) {
-			case BOARDCAST:
+		switch (stream.getMode()) {
+			case BROADCAST:
 				// every member runs the full stream, no leader involved
-				if (coordination.isMember(hostname) && !reg.isActive()) {
-					this.launch(reg);
-				} else if (!coordination.isMember(hostname) && reg.isActive()) {
-					this.stopLocal(reg);
+				if (coordination.isMember(hostname) && !runtime.isActive()) {
+					this.launch(runtime);
+				} else if (!coordination.isMember(hostname) && runtime.isActive()) {
+					this.stopLocal(runtime);
 				}
 				break;
 			case AUTO_RECOVER:
 				// only the lease holder runs; everyone else stands by
 				if (coordination.isLeader(hostname)) {
-					if (!reg.isActive())
-						this.launch(reg);
-				} else if (reg.isActive()) {
-					this.logger.info("Not the leader of " + csId + " anymore, stopping local runner");
-					this.stopLocal(reg);
+					if (!runtime.isActive())
+						this.launch(runtime);
+				} else if (runtime.isActive()) {
+					this.logger.info("Not the leader of " + streamId + " anymore, stopping local runner");
+					this.stopLocal(runtime);
 				}
 				break;
 			case AUTO_SCALE:
@@ -314,19 +326,19 @@ public class ChangeStreamService<T> {
 				int index = coordination.getMembers().indexOf(hostname);
 				int size = coordination.getMembers().size();
 				if (index >= 0) {
-					if (!reg.isActive()) {
-						this.partition(reg, index, size, coordination.getEpoch());
-						this.launch(reg);
-					} else if (reg.getAppliedEpoch() != coordination.getEpoch()) {
-						this.logger.info("Membership epoch of " + csId + " changed ("
-								+ reg.getAppliedEpoch() + " -> " + coordination.getEpoch()
+					if (!runtime.isActive()) {
+						this.partition(runtime, index, size, coordination.getEpoch());
+						this.launch(runtime);
+					} else if (runtime.getAppliedEpoch() != coordination.getEpoch()) {
+						this.logger.info("Membership epoch of " + streamId + " changed ("
+								+ runtime.getAppliedEpoch() + " -> " + coordination.getEpoch()
 								+ "), repartitioning " + (index + 1) + "/" + size);
-						this.stopLocal(reg);
-						this.partition(reg, index, size, coordination.getEpoch());
-						this.launch(reg);
+						this.stopLocal(runtime);
+						this.partition(runtime, index, size, coordination.getEpoch());
+						this.launch(runtime);
 					}
-				} else if (reg.isActive()) {
-					this.stopLocal(reg);
+				} else if (runtime.isActive()) {
+					this.stopLocal(runtime);
 				}
 				break;
 			default:
@@ -334,30 +346,30 @@ public class ChangeStreamService<T> {
 		}
 	}
 
-	/** Synchronizes the registry cache from the coordination document. */
-	private void apply(ChangeStreamRegistry<T> reg, ChangeStreamCoordination coordination) {
-		reg.setLeader(coordination.getLeader());
-		reg.setLeaseUntil(coordination.getLeaseUntil());
-		reg.setTerm(coordination.getTerm());
-		reg.setInstances(coordination.getMembers());
-		reg.setEpoch(coordination.getEpoch());
+	/** Synchronizes the runtime cache from the coordination document. */
+	private void apply(ChangeStreamRuntime<T> runtime, ChangeStreamCoordination coordination) {
+		runtime.setLeader(coordination.getLeader());
+		runtime.setLeaseUntil(coordination.getLeaseUntil());
+		runtime.setTerm(coordination.getTerm());
+		runtime.setInstances(coordination.getMembers());
+		runtime.setEpoch(coordination.getEpoch());
 	}
 
-	private void partition(ChangeStreamRegistry<T> reg, int index, int size, long epoch) {
-		reg.setInstanceIndex(index);
-		reg.setInstanceSize(size);
-		reg.setAppliedEpoch(epoch);
+	private void partition(ChangeStreamRuntime<T> runtime, int index, int size, long epoch) {
+		runtime.setPartitionIndex(index);
+		runtime.setPartitionCount(size);
+		runtime.setAppliedEpoch(epoch);
 	}
 
-	private void launch(ChangeStreamRegistry<T> reg) {
-		this.prepareResumeToken(reg);
-		this.run(reg);
+	private void launch(ChangeStreamRuntime<T> runtime) {
+		this.prepareResumeToken(runtime);
+		this.run(runtime);
 	}
 
 	/**
 	 * Selects the resume token to start from, according to the mode:
 	 * <ul>
-	 * <li>BOARDCAST — this host's own checkpoint (each member has its own
+	 * <li>BROADCAST — this host's own checkpoint (each member has its own
 	 * position); falls back to the oldest checkpoint of any host for new
 	 * members.</li>
 	 * <li>AUTO_RECOVER — the checkpoint of the highest fencing term (the last
@@ -367,36 +379,36 @@ public class ChangeStreamService<T> {
 	 * loses events over a repartition (at-least-once).</li>
 	 * </ul>
 	 */
-	private void prepareResumeToken(ChangeStreamRegistry<T> reg) {
-		ChangeStream<T> cs = reg.getChangeStream();
-		if (ResumeStrategy.NONE == cs.getResumeStrategy())
+	private void prepareResumeToken(ChangeStreamRuntime<T> runtime) {
+		ChangeStream<T> stream = runtime.getChangeStream();
+		if (ResumeStrategy.NONE == stream.getResumeStrategy())
 			return;
 		MongoCollection<Document> tokens = mongoTemplate
 				.getCollection(changeStreamProperties.getResumeTokenCollection());
-		String csId = cs.getId();
+		String streamId = stream.getId();
 		Document checkpoint = null;
-		switch (cs.getMode()) {
+		switch (stream.getMode()) {
 			case AUTO_RECOVER:
-				checkpoint = tokens.find(Filters.eq(CSID_FIELD, csId))
+				checkpoint = tokens.find(Filters.eq(CSID_FIELD, streamId))
 						.sort(Sorts.descending(TERM_FIELD, DATE_FIELD)).limit(1).first();
 				break;
-			case BOARDCAST:
+			case BROADCAST:
 				checkpoint = tokens.find(Filters.and(
-						Filters.eq(CSID_FIELD, csId),
+						Filters.eq(CSID_FIELD, streamId),
 						Filters.eq(HOST_FIELD, changeStreamProperties.getHostname()))).first();
 				if (checkpoint == null)
-					checkpoint = tokens.find(Filters.eq(CSID_FIELD, csId))
+					checkpoint = tokens.find(Filters.eq(CSID_FIELD, streamId))
 							.sort(Sorts.ascending(DATE_FIELD)).limit(1).first();
 				break;
 			case AUTO_SCALE:
 			default:
-				checkpoint = tokens.find(Filters.eq(CSID_FIELD, csId))
+				checkpoint = tokens.find(Filters.eq(CSID_FIELD, streamId))
 						.sort(Sorts.ascending(DATE_FIELD)).limit(1).first();
 				break;
 		}
-		cs.setResumeToken(checkpoint == null ? null : checkpoint.getString(TOKEN_FIELD));
+		stream.setResumeToken(checkpoint == null ? null : checkpoint.getString(TOKEN_FIELD));
 		if (checkpoint != null)
-			this.logger.info("Resume change stream " + csId + " from checkpoint of "
+			this.logger.info("Resume change stream " + streamId + " from checkpoint of "
 					+ checkpoint.get("_id") + " at " + checkpoint.getDate(DATE_FIELD));
 	}
 
@@ -407,56 +419,57 @@ public class ChangeStreamService<T> {
 	 * they stop the loop and request an asynchronous reconcile that restarts
 	 * the stream if this host should still run it.
 	 */
-	private void run(ChangeStreamRegistry<T> reg) {
-		ChangeStream<T> cs = reg.getChangeStream();
-		String csId = cs.getId();
-		if (!cs.claim()) {
-			this.logger.debug("Change stream " + csId + " already claimed, skip launch");
+	private void run(ChangeStreamRuntime<T> runtime) {
+		ChangeStream<T> stream = runtime.getChangeStream();
+		String streamId = stream.getId();
+		if (!stream.claim()) {
+			this.logger.debug("Change stream " + streamId + " already claimed, skip launch");
 			return;
 		}
-		long term = reg.getTerm();
+		long term = runtime.getTerm();
 		CompletableFuture<Object> completableFuture;
 		try {
-			completableFuture = this.submitWatch(reg, term);
+			completableFuture = this.submitWatch(runtime, term);
 		} catch (RuntimeException e) {
 			// executor rejected the task (e.g. shutdown): release the claim
-			cs.setRunning(false);
+			stream.setRunning(false);
 			throw e;
 		}
-		reg.setCompletableFuture(completableFuture);
-		this.logger.info("Change stream " + csId + " started (term " + term + ")");
+		runtime.setCompletableFuture(completableFuture);
+		this.logger.info("Change stream " + streamId + " started (term " + term + ")");
 	}
 
-	private CompletableFuture<Object> submitWatch(ChangeStreamRegistry<T> reg, long term) {
-		ChangeStream<T> cs = reg.getChangeStream();
-		String csId = cs.getId();
+	private CompletableFuture<Object> submitWatch(ChangeStreamRuntime<T> runtime, long term) {
+		ChangeStream<T> stream = runtime.getChangeStream();
+		String streamId = stream.getId();
 		return CompletableFuture.supplyAsync(() -> {
 			try {
-				if (reg.getCollectionName() != null) {
-					cs.watch(mongoTemplate.getCollection(reg.getCollectionName()), reg,
-							resumeToken -> saveCheckpoint(csId, resumeToken, term));
+				if (runtime.getCollectionName() != null) {
+					stream.watch(mongoTemplate.getCollection(runtime.getCollectionName()), runtime,
+							resumeToken -> saveCheckpoint(streamId, resumeToken, term));
 				} else {
-					cs.watch(mongoTemplate.getDb(), reg,
-							resumeToken -> saveCheckpoint(csId, resumeToken, term));
+					stream.watch(mongoTemplate.getDb(), runtime,
+							resumeToken -> saveCheckpoint(streamId, resumeToken, term));
 				}
 			} catch (MongoInterruptedException e) {
-				this.logger.info("Change stream '" + csId + "' interrupted");
+				this.logger.info("Change stream '" + streamId + "' interrupted");
 			} catch (RuntimeException e) {
-				if (isNonResumable(e) && cs.getResumeToken() != null) {
-					this.logger.warn("Change stream '" + csId + "' cannot resume from token '"
-							+ cs.getResumeToken()
-							+ "' (out of oplog window, or a token of an incompatible pipeline"
-							+ " e.g. after AUTO_SCALE repartitioning), discarding the checkpoint"
-							+ " and restarting: " + e.getMessage());
-					this.discardCheckpoints(csId, cs.getResumeToken());
-					cs.setResumeToken(null);
+				if (isNonResumable(e) && stream.getResumeToken() != null) {
+					this.logger.warn("Change stream '" + streamId + "' cannot resume from token '"
+							+ stream.getResumeToken()
+							+ "' (out of oplog window, a token of an incompatible pipeline"
+							+ " e.g. after AUTO_SCALE repartitioning, or an unusable token"
+							+ " e.g. checkpointed while the watched collection/database was"
+							+ " dropped), discarding the checkpoint and restarting: " + e.getMessage());
+					this.discardCheckpoints(streamId, stream.getResumeToken());
+					stream.setResumeToken(null);
 				} else {
-					this.logger.error("Change stream '" + csId + "' stopped due to unexpected error:", e);
+					this.logger.error("Change stream '" + streamId + "' stopped due to unexpected error:", e);
 				}
-				cs.setRunning(false);
+				stream.setRunning(false);
 				// fire-and-forget: the reconcile restarts the stream if this
 				// host should still run it, without joining our own future
-				this.requestReconcile(csId);
+				this.requestReconcile(streamId);
 			}
 			return null;
 		}, watchExecutor);
@@ -465,16 +478,20 @@ public class ChangeStreamService<T> {
 	/**
 	 * Whether the error means the stream can never be resumed from the current
 	 * resume token: the token fell out of the oplog window
-	 * ({@code ChangeStreamHistoryLost}), or it is not part of the stream's
-	 * token series ({@code ChangeStreamFatalError}, e.g. checkpoints written
-	 * by a differently partitioned AUTO_SCALE pipeline). Recovery is to
-	 * discard the checkpoint and restart from now (at-most-once for the lost
-	 * window).
+	 * ({@code ChangeStreamHistoryLost}), it is not part of the stream's token
+	 * series ({@code ChangeStreamFatalError}, e.g. checkpoints written by a
+	 * differently partitioned AUTO_SCALE pipeline), or the server rejects the
+	 * token outright ({@code InvalidResumeToken}, e.g. a checkpoint taken from
+	 * an invalidate notification when the watched collection or database was
+	 * dropped - note this error carries no {@code NonResumableChangeStreamError}
+	 * label). Recovery is to discard the checkpoint and restart from now
+	 * (at-most-once for the lost window).
 	 */
 	private static boolean isNonResumable(RuntimeException e) {
 		if (!(e instanceof MongoException mongoException))
 			return false;
 		return mongoException.hasErrorLabel("NonResumableChangeStreamError")
+				|| mongoException.getCode() == 260 // InvalidResumeToken
 				|| mongoException.getCode() == 280 // ChangeStreamFatalError
 				|| mongoException.getCode() == 286; // ChangeStreamHistoryLost
 	}
@@ -482,26 +499,26 @@ public class ChangeStreamService<T> {
 	/**
 	 * Deletes every checkpoint of the stream carrying the poisoned token,
 	 * regardless of the host that wrote it: resume selection may pick another
-	 * host's checkpoint (AUTO_RECOVER highest term, AUTO_SCALE/BOARDCAST
+	 * host's checkpoint (AUTO_RECOVER highest term, AUTO_SCALE/BROADCAST
 	 * fallback oldest), so deleting only our own document could resume from
 	 * the same invalid token forever. If other stale checkpoints remain, each
 	 * restart discards one more until the stream converges.
 	 */
-	private void discardCheckpoints(String csId, String token) {
+	private void discardCheckpoints(String streamId, String token) {
 		try {
 			mongoTemplate.getCollection(changeStreamProperties.getResumeTokenCollection()).deleteMany(
-					Filters.and(Filters.eq(CSID_FIELD, csId), Filters.eq(TOKEN_FIELD, token)));
+					Filters.and(Filters.eq(CSID_FIELD, streamId), Filters.eq(TOKEN_FIELD, token)));
 		} catch (RuntimeException cleanup) {
-			this.logger.warn("Unable to delete invalid checkpoint of " + csId, cleanup);
+			this.logger.warn("Unable to delete invalid checkpoint of " + streamId, cleanup);
 		}
 	}
 
 	/** Stops the local watch loop without touching the coordination state. */
-	private void stopLocal(ChangeStreamRegistry<T> reg) {
+	private void stopLocal(ChangeStreamRuntime<T> runtime) {
 		try {
-			reg.stop();
+			runtime.stop();
 		} catch (CompletionException e) {
-			this.logger.debug("Watch loop of " + reg.getChangeStream().getId() + " ended exceptionally", e);
+			this.logger.debug("Watch loop of " + runtime.getChangeStream().getId() + " ended exceptionally", e);
 		}
 	}
 
@@ -513,14 +530,14 @@ public class ChangeStreamService<T> {
 	 * (see {@link #prepareResumeToken}), so stale checkpoints can never move
 	 * the legitimate resume point (soft fencing without lockout risk).
 	 */
-	private void saveCheckpoint(String csId, BsonString token, long term) {
-		logger.debug("Save checkpoint of " + csId + " (term " + term + ")");
+	private void saveCheckpoint(String streamId, BsonString token, long term) {
+		logger.debug("Save checkpoint of " + streamId + " (term " + term + ")");
 		MongoException last = null;
 		for (int attempt = 1; attempt <= CHECKPOINT_MAX_RETRIES; attempt++) {
 			try {
 				mongoTemplate.getCollection(changeStreamProperties.getResumeTokenCollection()).updateOne(
 						Filters.and(
-								Filters.eq(CSID_FIELD, csId),
+								Filters.eq(CSID_FIELD, streamId),
 								Filters.eq(HOST_FIELD, changeStreamProperties.getHostname())),
 						Updates.combine(
 								Updates.set(DATE_FIELD, new Date()),
@@ -568,7 +585,7 @@ public class ChangeStreamService<T> {
 		listeners.clear();
 	}
 
-	private ReentrantLock lockFor(String csId) {
-		return locks.computeIfAbsent(csId, k -> new ReentrantLock());
+	private ReentrantLock lockFor(String streamId) {
+		return locks.computeIfAbsent(streamId, k -> new ReentrantLock());
 	}
 }

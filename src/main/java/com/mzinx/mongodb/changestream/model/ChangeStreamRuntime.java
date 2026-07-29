@@ -22,7 +22,7 @@ import lombok.NoArgsConstructor;
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
-public class ChangeStreamRegistry<T> {
+public class ChangeStreamRuntime<T> {
     private String collectionName;
     private ChangeStream<T> changeStream;
     private ChangeStreamListener<T> listener;
@@ -41,9 +41,9 @@ public class ChangeStreamRegistry<T> {
     private ChangeStreamConfig config;
 
     /** Partition index of this host among the sorted members (AUTO_SCALE). */
-    private int instanceIndex;
+    private int partitionIndex;
     /** Number of members sharing the stream (AUTO_SCALE). */
-    private int instanceSize;
+    private int partitionCount;
 
     /** Cached leader hostname from the coordination document. */
     private String leader;

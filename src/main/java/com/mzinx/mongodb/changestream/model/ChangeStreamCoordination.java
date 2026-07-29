@@ -15,7 +15,7 @@ import lombok.Data;
  *
  * <pre>
  * {
- *   _id: "csId",
+ *   _id: "streamId",
  *   l:   { h: "host-a", until: ISODate },  // leader lease (null = no leader)
  *   t:   NumberLong(7),                    // fencing term, bumped on every leadership change
  *   i:   ["host-a", "host-b"],             // sorted member hostnames
@@ -60,8 +60,8 @@ public class ChangeStreamCoordination {
     /** Monotonic membership epoch; bumped whenever {@link #members} changes. */
     private long epoch;
 
-    /** Server time of the last effective coordination change. */
-    private Date at;
+    /** Server time of the last effective coordination change (persisted as {@code at}). */
+    private Date changedAt;
 
     public boolean isMember(String host) {
         return this.members != null && this.members.contains(host);
@@ -95,7 +95,7 @@ public class ChangeStreamCoordination {
                 .term(asLong(doc.get(TERM_FIELD)))
                 .members(members == null ? List.of() : List.copyOf(members))
                 .epoch(asLong(doc.get(EPOCH_FIELD)))
-                .at(doc.getDate(DATE_FIELD))
+                .changedAt(doc.getDate(DATE_FIELD))
                 .build();
     }
 

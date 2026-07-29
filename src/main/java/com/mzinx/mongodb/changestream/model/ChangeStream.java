@@ -29,22 +29,29 @@ import lombok.Data;
 
 @Data
 public class ChangeStream<T> {
-    Logger logger = LoggerFactory.getLogger(getClass());
+    private final Logger logger = LoggerFactory.getLogger(getClass());
 
     public enum Mode {
-        BOARDCAST,
+        /** Every registered member runs the full stream. */
+        BROADCAST,
+        /** Exactly one leader runs the stream, with automatic failover. */
         AUTO_RECOVER,
+        /** Every member runs a disjoint hash partition of the stream. */
         AUTO_SCALE
     }
 
     public enum ResumeStrategy {
-        EVERY,
-        BATCH,
-        TIME,
+        /** Checkpoint the resume token after every event. */
+        PER_EVENT,
+        /** Checkpoint the resume token after each drained batch. */
+        PER_BATCH,
+        /** Checkpoint the resume token at a fixed interval ({@code checkpointInterval}). */
+        INTERVAL,
+        /** No resume token management; streams start from now on restart. */
         NONE
     }
 
-    private static final Long DEFAULT_SAVE_TOKEN_INTERVAL = 60 * 1000l;
+    private static final Long DEFAULT_CHECKPOINT_INTERVAL = 60 * 1000l;
 
     private String id;
     private Mode mode;
@@ -56,22 +63,23 @@ public class ChangeStream<T> {
     private List<Bson> pipeline = new ArrayList<>();
     private Class<T> documentClass;
 
-    private ChangeStreamIterable<T> _changeStream;
+    /** The configured driver iterable the cursor is opened from. */
+    private ChangeStreamIterable<T> iterable;
     private MongoChangeStreamCursor<ChangeStreamDocument<T>> cursor;
     private boolean running = false;
-    private Long saveTokenInterval = DEFAULT_SAVE_TOKEN_INTERVAL;
+    private Long checkpointInterval = DEFAULT_CHECKPOINT_INTERVAL;
     private String resumeToken;
-    private ChangeStreamListener<T> consumer;
+    private ChangeStreamListener<T> listener;
 
     public ChangeStream(String id, Mode mode, Integer batchSize, Long maxAwaitTime,
-            ResumeStrategy resumeStrategy, long saveTokenInterval, FullDocumentBeforeChange fullDocumentBeforeChange,
+            ResumeStrategy resumeStrategy, long checkpointInterval, FullDocumentBeforeChange fullDocumentBeforeChange,
             FullDocument fullDocument, List<Bson> pipeline, Class<T> clazz) {
         this.id = id;
         this.mode = mode;
         this.batchSize = batchSize;
         this.maxAwaitTime = maxAwaitTime;
         this.resumeStrategy = resumeStrategy;
-        this.saveTokenInterval = saveTokenInterval;
+        this.checkpointInterval = checkpointInterval;
         this.fullDocumentBeforeChange = fullDocumentBeforeChange;
         this.fullDocument = fullDocument;
         this.pipeline.clear();
@@ -104,15 +112,15 @@ public class ChangeStream<T> {
         return true;
     }
 
-    public void watch(MongoCollection<?> coll, ChangeStreamRegistry<T> reg,
-            Consumer<BsonString> checkPoint) {
-        this._changeStream = coll.watch(getScaledPipeline(reg), this.documentClass);
-        this.watch(reg.getListener(), checkPoint);
+    public void watch(MongoCollection<?> coll, ChangeStreamRuntime<T> runtime,
+            Consumer<BsonString> checkpoint) {
+        this.iterable = coll.watch(getScaledPipeline(runtime), this.documentClass);
+        this.watch(runtime.getListener(), checkpoint);
     }
 
-    public void watch(MongoDatabase db, ChangeStreamRegistry<T> reg, Consumer<BsonString> checkPoint) {
-        this._changeStream = db.watch(getScaledPipeline(reg), this.documentClass);
-        this.watch(reg.getListener(), checkPoint);
+    public void watch(MongoDatabase db, ChangeStreamRuntime<T> runtime, Consumer<BsonString> checkpoint) {
+        this.iterable = db.watch(getScaledPipeline(runtime), this.documentClass);
+        this.watch(runtime.getListener(), checkpoint);
     }
 
     /**
@@ -121,50 +129,56 @@ public class ChangeStream<T> {
      * the meantime ({@link #setRunning setRunning(false)}), the loop exits
      * immediately without opening a cursor.
      */
-    public void watch(ChangeStreamListener<T> consumer, Consumer<BsonString> checkPoint) {
+    public void watch(ChangeStreamListener<T> listener, Consumer<BsonString> checkpoint) {
         logger.info("Initializing change stream " + this.getId());
 
         if (!this.isRunning()) {
             logger.info("Change stream " + this.getId() + " was stopped before starting");
             return;
         }
-        this.consumer = consumer;
+        this.listener = listener;
         if (this.batchSize != null) {
-            this._changeStream = this._changeStream.batchSize(this.batchSize);
+            this.iterable = this.iterable.batchSize(this.batchSize);
         }
         if (this.maxAwaitTime != null) {
-            this._changeStream = this._changeStream.maxAwaitTime(this.maxAwaitTime, TimeUnit.MILLISECONDS);
+            this.iterable = this.iterable.maxAwaitTime(this.maxAwaitTime, TimeUnit.MILLISECONDS);
         }
         if (resumeToken != null) {
-            this._changeStream = this._changeStream
-                    .resumeAfter(new Document("_data", resumeToken).toBsonDocument());
+            // startAfter (not resumeAfter) so the stream also resumes across an
+            // invalidate notification, e.g. a checkpoint taken while the watched
+            // collection or database was dropped (resumeAfter would fail with
+            // error 260 InvalidResumeToken); for regular tokens both behave the
+            // same.
+            this.iterable = this.iterable
+                    .startAfter(new Document("_data", resumeToken).toBsonDocument());
         }
         if (fullDocument != null) {
-            this._changeStream = this._changeStream.fullDocument(fullDocument);
+            this.iterable = this.iterable.fullDocument(fullDocument);
         }
         if (fullDocumentBeforeChange != null) {
-            this._changeStream = this._changeStream.fullDocumentBeforeChange(fullDocumentBeforeChange);
+            this.iterable = this.iterable.fullDocumentBeforeChange(fullDocumentBeforeChange);
         }
         // Invalid resume tokens (out of oplog window: ChangeStreamHistoryLost 286;
         // token not part of this stream's series, e.g. checkpoints of a differently
         // partitioned AUTO_SCALE pipeline: ChangeStreamFatalError 280 /
-        // NonResumableChangeStreamError) are recovered by ChangeStreamService:
-        // the failure propagates from here, the poisoned checkpoint is discarded
-        // and the stream is restarted without it.
-        this.cursor = this._changeStream.cursor();
+        // NonResumableChangeStreamError; unusable token: InvalidResumeToken 260)
+        // are recovered by ChangeStreamService: the failure propagates from here,
+        // the poisoned checkpoint is discarded and the stream is restarted
+        // without it.
+        this.cursor = this.iterable.cursor();
         ScheduledExecutorService scheduler = null;
-        if (ResumeStrategy.TIME == this.getResumeStrategy()) {
-            scheduler = this.timer(this, checkPoint);
+        if (ResumeStrategy.INTERVAL == this.getResumeStrategy()) {
+            scheduler = this.scheduleCheckpointTimer(this, checkpoint);
         }
 
         try {
             while (this.isRunning()) {
-                ChangeStreamDocument<T> e = this.getCursor().tryNext();
-                if (e != null) {
-                    this.getConsumer().execute(e);
-                    if ((ResumeStrategy.BATCH == this.getResumeStrategy() && this.getCursor().available() == 0)
-                            || ResumeStrategy.EVERY == this.getResumeStrategy()) {
-                        checkPoint.accept(e.getResumeToken().getString("_data"));
+                ChangeStreamDocument<T> event = this.getCursor().tryNext();
+                if (event != null) {
+                    this.getListener().onEvent(event);
+                    if ((ResumeStrategy.PER_BATCH == this.getResumeStrategy() && this.getCursor().available() == 0)
+                            || ResumeStrategy.PER_EVENT == this.getResumeStrategy()) {
+                        checkpoint.accept(event.getResumeToken().getString("_data"));
                     }
                 }
             }
@@ -181,34 +195,34 @@ public class ChangeStream<T> {
         }
     }
 
-    private List<Bson> getScaledPipeline(ChangeStreamRegistry<T> reg) {
+    private List<Bson> getScaledPipeline(ChangeStreamRuntime<T> runtime) {
         List<Bson> list = new ArrayList<>(this.pipeline);
-        if (Mode.AUTO_SCALE == reg.getChangeStream().getMode() && reg.getInstanceSize() > 0
-                && reg.getInstanceIndex() >= 0) {
+        if (Mode.AUTO_SCALE == runtime.getChangeStream().getMode() && runtime.getPartitionCount() > 0
+                && runtime.getPartitionIndex() >= 0) {
             list.add(new Document("$match",
                     new Document("$expr",
                             new Document("$eq", Arrays.asList(new Document("$abs",
                                     new Document("$mod", Arrays.asList(
                                             new Document("$toHashedIndexKey", "$documentKey._id"),
-                                            reg.getInstanceSize()))),
-                                    reg.getInstanceIndex()))))
+                                            runtime.getPartitionCount()))),
+                                    runtime.getPartitionIndex()))))
                     .toBsonDocument());
         }
         return list;
     }
 
-    private ScheduledExecutorService timer(ChangeStream<T> cs, Consumer<BsonString> checkPoint) {
+    private ScheduledExecutorService scheduleCheckpointTimer(ChangeStream<T> stream, Consumer<BsonString> checkpoint) {
         ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
         Runnable task = new Runnable() {
             @Override
             public void run() {
                 try {
-                    if (cs.isRunning()) {
-                        if (cs.getCursor().getResumeToken() != null)
-                            checkPoint.accept(cs.getCursor().getResumeToken().getString("_data"));
+                    if (stream.isRunning()) {
+                        if (stream.getCursor().getResumeToken() != null)
+                            checkpoint.accept(stream.getCursor().getResumeToken().getString("_data"));
                     } else {
                         scheduler.shutdown();
-                        logger.info("timer stopped");
+                        logger.info("Checkpoint timer stopped");
                     }
                 } catch (MongoWriteException e) {
                     if (e.getError().getCategory() == ErrorCategory.DUPLICATE_KEY) {
@@ -219,18 +233,18 @@ public class ChangeStream<T> {
                 } catch (Exception e) {
                     scheduler.shutdown();
                     logger.error("Unexpected error:", e);
-                    cs.setRunning(false);
+                    stream.setRunning(false);
                     throw e;
                 }
             }
         };
-        logger.info("start timer:" + cs.getSaveTokenInterval());
-        scheduler.scheduleAtFixedRate(task, 0, cs.getSaveTokenInterval(), TimeUnit.MILLISECONDS);
+        logger.info("Start checkpoint timer: " + stream.getCheckpointInterval());
+        scheduler.scheduleAtFixedRate(task, 0, stream.getCheckpointInterval(), TimeUnit.MILLISECONDS);
         return scheduler;
     }
 
     public static ChangeStream<Document> of(String id) {
-        return of(id, Mode.BOARDCAST);
+        return of(id, Mode.BROADCAST);
     }
 
     public static ChangeStream<Document> of(String id, Mode mode) {
@@ -239,7 +253,7 @@ public class ChangeStream<T> {
 
     public static ChangeStream<Document> of(String id, Mode mode,
             List<Bson> pipeline) {
-        return new ChangeStream<Document>(id, mode, null, null, ResumeStrategy.NONE, DEFAULT_SAVE_TOKEN_INTERVAL, null,
+        return new ChangeStream<Document>(id, mode, null, null, ResumeStrategy.NONE, DEFAULT_CHECKPOINT_INTERVAL, null,
                 null,
                 pipeline,
                 Document.class);
@@ -247,48 +261,53 @@ public class ChangeStream<T> {
 
     public ChangeStream<T> batchSize(Integer batchSize) {
         return new ChangeStream<T>(this.id, this.mode, batchSize, this.maxAwaitTime,
-                this.resumeStrategy, this.saveTokenInterval, this.fullDocumentBeforeChange, this.fullDocument,
+                this.resumeStrategy, this.checkpointInterval, this.fullDocumentBeforeChange, this.fullDocument,
                 this.pipeline, this.documentClass);
     }
 
     public ChangeStream<T> maxAwaitTime(Long maxAwaitTime) {
         return new ChangeStream<T>(this.id, this.mode, this.batchSize, maxAwaitTime,
-                this.resumeStrategy, this.saveTokenInterval, this.fullDocumentBeforeChange, this.fullDocument,
+                this.resumeStrategy, this.checkpointInterval, this.fullDocumentBeforeChange, this.fullDocument,
                 this.pipeline, this.documentClass);
     }
 
     public ChangeStream<T> resumeStrategy(ResumeStrategy resumeStrategy) {
         return new ChangeStream<T>(this.id, this.mode, this.batchSize, maxAwaitTime,
-                resumeStrategy, this.saveTokenInterval, this.fullDocumentBeforeChange, this.fullDocument, this.pipeline,
+                resumeStrategy, this.checkpointInterval, this.fullDocumentBeforeChange, this.fullDocument, this.pipeline,
                 this.documentClass);
     }
 
-    public ChangeStream<T> resumeStrategy(ResumeStrategy resumeStrategy, long saveTokenInterval) {
+    public ChangeStream<T> resumeStrategy(ResumeStrategy resumeStrategy, long checkpointInterval) {
         return new ChangeStream<T>(this.id, this.mode, this.batchSize, maxAwaitTime,
-                resumeStrategy, saveTokenInterval, this.fullDocumentBeforeChange, this.fullDocument, this.pipeline,
+                resumeStrategy, checkpointInterval, this.fullDocumentBeforeChange, this.fullDocument, this.pipeline,
                 this.documentClass);
     }
 
-    public ChangeStream<T> resumeAfter(String resumeToken) {
+    /**
+     * Resumes the stream from the given checkpoint token. Applied with the
+     * driver's {@code startAfter}, so resuming across an invalidate event
+     * (e.g. a dropped collection) is supported.
+     */
+    public ChangeStream<T> resumeFrom(String resumeToken) {
         this.resumeToken = resumeToken;
         return this;
     }
 
     public ChangeStream<T> fullDocumentBeforeChange(FullDocumentBeforeChange fullDocumentBeforeChange) {
         return new ChangeStream<T>(this.id, this.mode, this.batchSize, maxAwaitTime,
-                this.resumeStrategy, this.saveTokenInterval, fullDocumentBeforeChange, this.fullDocument, this.pipeline,
+                this.resumeStrategy, this.checkpointInterval, fullDocumentBeforeChange, this.fullDocument, this.pipeline,
                 this.documentClass);
     }
 
     public ChangeStream<T> fullDocument(FullDocument fullDocument) {
         return new ChangeStream<T>(this.id, this.mode, this.batchSize, maxAwaitTime,
-                this.resumeStrategy, this.saveTokenInterval, this.fullDocumentBeforeChange, fullDocument, this.pipeline,
+                this.resumeStrategy, this.checkpointInterval, this.fullDocumentBeforeChange, fullDocument, this.pipeline,
                 this.documentClass);
     }
 
     public <NewT> ChangeStream<NewT> withClass(Class<NewT> clazz) {
         return new ChangeStream<NewT>(this.id, this.mode, this.batchSize, this.maxAwaitTime,
-                this.resumeStrategy, this.saveTokenInterval, this.fullDocumentBeforeChange, this.fullDocument,
+                this.resumeStrategy, this.checkpointInterval, this.fullDocumentBeforeChange, this.fullDocument,
                 this.pipeline, clazz);
     }
 

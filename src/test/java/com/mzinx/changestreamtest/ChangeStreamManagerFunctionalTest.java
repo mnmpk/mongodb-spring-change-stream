@@ -128,13 +128,13 @@ class ChangeStreamManagerFunctionalTest {
         ChangeStreamStatus status = this.changeStreamManager.getChangeStreamStatus(COORDINATION_STREAM_ID)
                 .orElseThrow();
         assertTrue(status.isRunning());
-        assertEquals(Mode.BOARDCAST, status.getMode());
-        assertEquals(this.changeStreamProperties.getChangeStreamCollection(), status.getCollectionName());
-        // BOARDCAST mode needs no leader: every member runs the full stream
+        assertEquals(Mode.BROADCAST, status.getMode());
+        assertEquals(this.changeStreamProperties.getCoordinationCollection(), status.getCollectionName());
+        // BROADCAST mode needs no leader: every member runs the full stream
         assertNull(status.getLeader());
         assertTrue(status.getInstances().contains(this.changeStreamProperties.getHostname()));
         assertFalse(status.isManagedByConfig(), "coordination stream is internal, not config driven");
-        assertEquals("ChangeStreamWatch", status.getListener());
+        assertEquals("CoordinationChangeListener", status.getListener());
     }
 
     @Test
@@ -143,7 +143,7 @@ class ChangeStreamManagerFunctionalTest {
         this.changeStreamConfigService.save(ChangeStreamConfig.builder()
                 .id(CONFIG_STREAM_ID)
                 .collectionName(WATCHED_COLLECTION)
-                .mode(Mode.BOARDCAST)
+                .mode(Mode.BROADCAST)
                 .listener("testChangeStreamListener")
                 .build());
 
@@ -154,8 +154,8 @@ class ChangeStreamManagerFunctionalTest {
         ChangeStreamStatus status = this.changeStreamManager.getChangeStreamStatus(CONFIG_STREAM_ID).orElseThrow();
         assertTrue(status.isRunning());
         assertEquals(WATCHED_COLLECTION, status.getCollectionName());
-        assertEquals(Mode.BOARDCAST, status.getMode());
-        // BOARDCAST mode needs no leader: every member runs the full stream
+        assertEquals(Mode.BROADCAST, status.getMode());
+        // BROADCAST mode needs no leader: every member runs the full stream
         assertNull(status.getLeader());
         assertTrue(status.getInstances().contains(this.changeStreamProperties.getHostname()));
         assertTrue(status.isManagedByConfig());
@@ -206,7 +206,7 @@ class ChangeStreamManagerFunctionalTest {
         // deregistration write completes, so poll the document)
         await("host to be deregistered from the coordination document", STOP_TIMEOUT_MS, () -> {
             Document coordinationDoc = this.mongoTemplate
-                    .getCollection(this.changeStreamProperties.getChangeStreamCollection())
+                    .getCollection(this.changeStreamProperties.getCoordinationCollection())
                     .find(new Document("_id", CONFIG_STREAM_ID)).first();
             return coordinationDoc != null && !coordinationDoc.getList("i", String.class)
                     .contains(this.changeStreamProperties.getHostname());
@@ -222,7 +222,7 @@ class ChangeStreamManagerFunctionalTest {
         this.changeStreamConfigService.save(ChangeStreamConfig.builder()
                 .id(REMOVED_CONFIG_STREAM_ID)
                 .collectionName(WATCHED_COLLECTION)
-                .mode(Mode.BOARDCAST)
+                .mode(Mode.BROADCAST)
                 .listener("testChangeStreamListener")
                 .build());
 
@@ -269,7 +269,7 @@ class ChangeStreamManagerFunctionalTest {
                 .orElseThrow().getTerm();
 
         // simulate another instance holding a valid lease: this host must stop
-        this.mongoTemplate.getCollection(this.changeStreamProperties.getChangeStreamCollection()).updateOne(
+        this.mongoTemplate.getCollection(this.changeStreamProperties.getCoordinationCollection()).updateOne(
                 new Document("_id", RECOVER_STREAM_ID),
                 new Document("$set", new Document("l", new Document("h", "other-host")
                         .append("until", new Date(System.currentTimeMillis() + 3_600_000)))));
@@ -279,7 +279,7 @@ class ChangeStreamManagerFunctionalTest {
                         .map(s -> "other-host".equals(s.getLeader()) && !s.isRunning()).orElse(false));
 
         // expire the foreign lease: this host must take over with a higher term
-        this.mongoTemplate.getCollection(this.changeStreamProperties.getChangeStreamCollection()).updateOne(
+        this.mongoTemplate.getCollection(this.changeStreamProperties.getCoordinationCollection()).updateOne(
                 new Document("_id", RECOVER_STREAM_ID),
                 new Document("$set", new Document("l.until", new Date(System.currentTimeMillis() - 1_000))));
 
@@ -304,25 +304,25 @@ class ChangeStreamManagerFunctionalTest {
 
         await("auto-scale stream to start as the only member", START_TIMEOUT_MS,
                 () -> this.changeStreamManager.getChangeStreamStatus(SCALE_STREAM_ID)
-                        .map(s -> s.isRunning() && s.getInstanceSize() == 1).orElse(false));
+                        .map(s -> s.isRunning() && s.getPartitionCount() == 1).orElse(false));
 
         ChangeStreamStatus status = this.changeStreamManager.getChangeStreamStatus(SCALE_STREAM_ID).orElseThrow();
-        assertEquals(0, status.getInstanceIndex());
+        assertEquals(0, status.getPartitionIndex());
         assertTrue(status.getEpoch() >= 1, "first join must bump the membership epoch");
 
         // simulate a second member joining: bump the epoch, everyone repartitions
         // deterministically from the sorted member list
         String hostname = this.changeStreamProperties.getHostname();
         List<String> members = List.of(hostname, "zzz-fake-host").stream().sorted().toList();
-        this.mongoTemplate.getCollection(this.changeStreamProperties.getChangeStreamCollection()).updateOne(
+        this.mongoTemplate.getCollection(this.changeStreamProperties.getCoordinationCollection()).updateOne(
                 new Document("_id", SCALE_STREAM_ID),
                 new Document("$set", new Document("i", members)
                         .append("e", status.getEpoch() + 1)));
 
         await("auto-scale stream to repartition to 2 members", START_TIMEOUT_MS,
                 () -> this.changeStreamManager.getChangeStreamStatus(SCALE_STREAM_ID)
-                        .map(s -> s.isRunning() && s.getInstanceSize() == 2
-                                && s.getInstanceIndex() == members.indexOf(hostname))
+                        .map(s -> s.isRunning() && s.getPartitionCount() == 2
+                                && s.getPartitionIndex() == members.indexOf(hostname))
                         .orElse(false));
     }
 
@@ -333,7 +333,7 @@ class ChangeStreamManagerFunctionalTest {
         this.changeStreamConfigService.save(ChangeStreamConfig.builder()
                 .id(CONFIG_STREAM_ID + "-sync")
                 .collectionName(WATCHED_COLLECTION)
-                .mode(Mode.BOARDCAST)
+                .mode(Mode.BROADCAST)
                 .listener("testChangeStreamListener")
                 .build());
 
@@ -343,12 +343,12 @@ class ChangeStreamManagerFunctionalTest {
 
         // externally wipe the membership: the reconciler must re-join (repair
         // the document) and re-synchronize the registry cache from it
-        this.mongoTemplate.getCollection(this.changeStreamProperties.getChangeStreamCollection()).updateOne(
+        this.mongoTemplate.getCollection(this.changeStreamProperties.getCoordinationCollection()).updateOne(
                 new Document("_id", CONFIG_STREAM_ID + "-sync"),
                 new Document("$set", new Document("i", List.of())));
 
         await("coordination document to be repaired and registry re-synchronized", START_TIMEOUT_MS, () -> {
-            Document doc = this.mongoTemplate.getCollection(this.changeStreamProperties.getChangeStreamCollection())
+            Document doc = this.mongoTemplate.getCollection(this.changeStreamProperties.getCoordinationCollection())
                     .find(new Document("_id", CONFIG_STREAM_ID + "-sync")).first();
             boolean docRepaired = doc != null && doc.getList("i", String.class).contains(hostname);
             boolean registrySynced = this.changeStreamManager.getChangeStreamStatus(CONFIG_STREAM_ID + "-sync")
@@ -362,7 +362,7 @@ class ChangeStreamManagerFunctionalTest {
     void legacyCoordinationDocumentIsMigratedAndTakenOver() {
         String legacyId = "orders-functional-stream-legacy";
         // pre-0.0.7 document shape: leader as plain string, no term/epoch
-        this.mongoTemplate.getCollection(this.changeStreamProperties.getChangeStreamCollection()).insertOne(
+        this.mongoTemplate.getCollection(this.changeStreamProperties.getCoordinationCollection()).insertOne(
                 new Document("_id", legacyId)
                         .append("l", "dead-legacy-host")
                         .append("i", List.of("dead-legacy-host"))
@@ -384,7 +384,7 @@ class ChangeStreamManagerFunctionalTest {
                                 && s.getTerm() >= 1)
                         .orElse(false));
 
-        Document doc = this.mongoTemplate.getCollection(this.changeStreamProperties.getChangeStreamCollection())
+        Document doc = this.mongoTemplate.getCollection(this.changeStreamProperties.getCoordinationCollection())
                 .find(new Document("_id", legacyId)).first();
         assertTrue(doc.get("l") instanceof Document, "leader must be migrated to the lease shape");
         assertEquals(this.changeStreamProperties.getHostname(), ((Document) doc.get("l")).getString("h"));
