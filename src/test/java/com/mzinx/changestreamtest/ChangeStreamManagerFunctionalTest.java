@@ -28,7 +28,7 @@ import org.springframework.test.context.DynamicPropertySource;
 
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
-import com.mzinx.mongodb.changestream.bootstrap.ChangeStreamManager;
+import com.mzinx.mongodb.changestream.ChangeStreamManager;
 import com.mzinx.mongodb.changestream.config.ChangeStreamProperties;
 import com.mzinx.mongodb.changestream.model.ChangeStream.Mode;
 import com.mzinx.mongodb.changestream.model.ChangeStreamConfig;

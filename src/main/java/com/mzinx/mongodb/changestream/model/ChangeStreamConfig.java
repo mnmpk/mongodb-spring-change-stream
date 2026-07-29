@@ -23,7 +23,7 @@ import lombok.NoArgsConstructor;
  * Persistent definition of a change stream, stored in the
  * {@code change-stream.changeStreamConfigCollection} collection.
  * <p>
- * The {@link com.mzinx.mongodb.changestream.bootstrap.ChangeStreamManager}
+ * The {@link com.mzinx.mongodb.changestream.ChangeStreamManager}
  * periodically fetches these configs and manages the corresponding change
  * stream life cycles (start, restart on change, stop on removal/disable).
  */

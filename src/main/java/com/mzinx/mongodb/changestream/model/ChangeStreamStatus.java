@@ -12,7 +12,7 @@ import lombok.Data;
 /**
  * Read-only snapshot of a registered change stream and its runtime status,
  * exposed by
- * {@link com.mzinx.mongodb.changestream.bootstrap.ChangeStreamManager}.
+ * {@link com.mzinx.mongodb.changestream.ChangeStreamManager}.
  */
 @Data
 @Builder

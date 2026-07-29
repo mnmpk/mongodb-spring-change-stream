@@ -17,7 +17,7 @@ import com.mzinx.mongodb.changestream.model.ChangeStreamConfig;
  * Stores {@link ChangeStreamConfig} documents in the
  * {@code change-stream.changeStreamConfigCollection} collection.
  * <p>
- * The {@link com.mzinx.mongodb.changestream.bootstrap.ChangeStreamManager}
+ * The {@link com.mzinx.mongodb.changestream.ChangeStreamManager}
  * fetches these configs and manages the change stream life cycles accordingly.
  */
 @Service
