@@ -201,6 +201,10 @@ Optional<ChangeStreamStatus> status = changeStreamManager.getChangeStreamStatus(
 
 ## Coordination and Reconciliation
 
+> A full design document — including component/sequence diagrams and every
+> coordination aggregation pipeline in JSON — is available in
+> [COORDINATION.md](COORDINATION.md).
+
 The distributed state of every change stream lives in a single coordination
 document (collection `change-stream.coordinationCollection`, default
 `_changeStreams`) — the single source of truth:

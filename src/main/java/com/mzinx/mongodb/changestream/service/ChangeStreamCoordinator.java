@@ -252,7 +252,7 @@ public class ChangeStreamCoordinator {
 
     /**
      * Actively deletes instance documents whose heartbeat is older than
-     * {@code change-stream.maxTimeout}, instead of waiting for the TTL monitor
+     * {@code change-stream.instanceLivenessTimeout}, instead of waiting for the TTL monitor
      * (which only sweeps about once a minute). This shortens failover latency
      * and produces the delete events the fast reconcile path reacts to.
      */
