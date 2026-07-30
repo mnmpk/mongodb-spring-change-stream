@@ -564,3 +564,52 @@ lease expires (`leaseDuration`) or earlier when its heartbeat is swept
 (`instanceLivenessTimeout`) and `repair` releases the lease — whichever
 happens first. The `_instances` delete event makes the takeover near-instant
 in practice; the scheduled cycle guarantees it even if the event is lost.
+
+---
+
+## 9. Degraded Mode: Running Without Discovery
+
+The heartbeat feed into `_instances` normally comes from the companion
+`mongodb-spring-discovery` module. When it is not on the classpath (or no
+equivalent heartbeat writer exists), `_instances` stays **empty**, and the
+mechanism detects this explicitly instead of misbehaving:
+
+- `ChangeStreamCoordinator.aliveInstances()` returns an **empty list** when
+  the instance collection has zero documents — "liveness unknown", not
+  "everyone is dead".
+- Both repair call sites guard on that (`if (!alive.isEmpty())`):
+  `ChangeStreamManager.housekeeping()` skips `repair()`, and
+  `sweepDeadInstances()` finds nothing to sweep.
+- The **fast failover path never fires**: it is driven by DELETE events on
+  `_instances`, which never occur.
+
+What still works: graceful shutdown is unaffected — `@PreDestroy` →
+`ChangeStreamService.doStop()` → `coordinator.leave(streamId)` cleans up
+membership and releases a held lease. Only **crashes** leave stale state
+behind, because nothing evicts dead members or releases dead leases early.
+
+### 9.1 Impact per mode
+
+| Mode | Behavior without discovery |
+|---|---|
+| `BROADCAST` | Works. But crashed hosts stay in `i` forever: the coordination document never qualifies for `deleteOrphans` (requires empty member list), and a dead host's stale checkpoint can be picked as the "oldest fallback" by a newly joining host — replaying up to `tokenMaxLifeTime` (24 h) of events. |
+| `AUTO_RECOVER` | **Still correct.** The lease is a built-in failure detector: `acquireOrRenewLease` takes over as soon as `l.until < $$NOW`, independent of heartbeats, and fencing (`t`) stays intact. Only the failover latency degrades: from ~seconds (fast path) to worst-case `leaseDuration + configRefreshInterval` (~2 min with defaults). |
+| `AUTO_SCALE` | **Unsafe against crashes.** A crashed member is never removed from the sorted member list `i`, so the epoch never bumps, survivors never repartition, and the dead host's hash partition is **silently never processed** — a permanent data gap until the host returns, an operator intervenes (`reset` / manual document edit), or a heartbeat mechanism is added. |
+
+### 9.2 Deployment guidance
+
+- **Single instance:** fine without discovery; there is nothing to fail over
+  to, and the empty-collection guard exists precisely for this case.
+- **Multi-instance, AUTO_RECOVER only:** acceptable if ~2-minute failover is
+  tolerable; tighten `change-stream.leaseDuration` and
+  `change-stream.configRefreshInterval` to shrink the window.
+- **Multi-instance with AUTO_SCALE:** a heartbeat writer is effectively
+  **required**. The contract is minimal and not tied to the discovery
+  module: upsert `{ "_id": "<hostname>", "at": <Date> }` into
+  `change-stream.instanceCollection` more frequently than
+  `change-stream.instanceLivenessTimeout`.
+- **Never mix:** if some instances heartbeat and others do not, the silent
+  ones look dead to the heartbeating ones — `repair` evicts them every
+  cycle, they re-`join` on their next reconcile, and the resulting epoch
+  churn causes perpetual repartition thrash. Heartbeating is all-or-nothing
+  per deployment.
