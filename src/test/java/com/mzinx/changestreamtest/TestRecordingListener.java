@@ -18,7 +18,8 @@ public class TestRecordingListener implements ChangeStreamListener<Document> {
     private final List<ChangeStreamDocument<Document>> events = new CopyOnWriteArrayList<>();
 
     @Override
-    public void onEvent(ChangeStreamDocument<Document> doc) {
+    public void onEvent(String streamId, java.util.Map<String, Object> attributes,
+            ChangeStreamDocument<Document> doc) {
         this.events.add(doc);
     }
 
