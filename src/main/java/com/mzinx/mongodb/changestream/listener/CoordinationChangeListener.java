@@ -49,8 +49,11 @@ public class CoordinationChangeListener implements ChangeStreamListener<Document
     }
 
     @Override
-    public void onEvent(ChangeStreamDocument<Document> event) {
+    public void onEvent(String sourceStreamId, java.util.Map<String, Object> attributes,
+            ChangeStreamDocument<Document> event) {
         this.logger.debug("coordination change: " + event);
+        // The coordination doc's _id is the id of the stream whose coordination
+        // changed (not sourceStreamId, which is the coordination stream itself).
         String streamId = event.getDocumentKey().getString("_id").getValue();
         if (!this.changeStreamRegistry.contains(streamId)) {
             this.logger.debug("Change stream " + streamId + " is not registered on this instance, ignoring.");

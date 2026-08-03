@@ -3,6 +3,7 @@ package com.mzinx.mongodb.changestream.model;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -62,6 +63,14 @@ public class ChangeStream<T> {
     private FullDocument fullDocument;
     private List<Bson> pipeline = new ArrayList<>();
     private Class<T> documentClass;
+
+    /**
+     * Free-form, listener-defined settings carried from the originating
+     * {@link ChangeStreamConfig#getAttributes()}. Snapshotted at build time and
+     * passed to the listener on every event, so a listener needs no per-event
+     * database lookup to read its configuration.
+     */
+    private Map<String, Object> attributes;
 
     /** The configured driver iterable the cursor is opened from. */
     private ChangeStreamIterable<T> iterable;
@@ -175,7 +184,7 @@ public class ChangeStream<T> {
             while (this.isRunning()) {
                 ChangeStreamDocument<T> event = this.getCursor().tryNext();
                 if (event != null) {
-                    this.getListener().onEvent(event);
+                    this.getListener().onEvent(this.getId(), this.getAttributes(), event);
                     if ((ResumeStrategy.PER_BATCH == this.getResumeStrategy() && this.getCursor().available() == 0)
                             || ResumeStrategy.PER_EVENT == this.getResumeStrategy()) {
                         checkpoint.accept(event.getResumeToken().getString("_data"));
@@ -259,28 +268,34 @@ public class ChangeStream<T> {
                 Document.class);
     }
 
+    /** Copies the non-constructor metadata ({@code attributes}) onto a derived stream. */
+    private <U> ChangeStream<U> withMeta(ChangeStream<U> copy) {
+        copy.setAttributes(this.attributes);
+        return copy;
+    }
+
     public ChangeStream<T> batchSize(Integer batchSize) {
-        return new ChangeStream<T>(this.id, this.mode, batchSize, this.maxAwaitTime,
+        return withMeta(new ChangeStream<T>(this.id, this.mode, batchSize, this.maxAwaitTime,
                 this.resumeStrategy, this.checkpointInterval, this.fullDocumentBeforeChange, this.fullDocument,
-                this.pipeline, this.documentClass);
+                this.pipeline, this.documentClass));
     }
 
     public ChangeStream<T> maxAwaitTime(Long maxAwaitTime) {
-        return new ChangeStream<T>(this.id, this.mode, this.batchSize, maxAwaitTime,
+        return withMeta(new ChangeStream<T>(this.id, this.mode, this.batchSize, maxAwaitTime,
                 this.resumeStrategy, this.checkpointInterval, this.fullDocumentBeforeChange, this.fullDocument,
-                this.pipeline, this.documentClass);
+                this.pipeline, this.documentClass));
     }
 
     public ChangeStream<T> resumeStrategy(ResumeStrategy resumeStrategy) {
-        return new ChangeStream<T>(this.id, this.mode, this.batchSize, maxAwaitTime,
+        return withMeta(new ChangeStream<T>(this.id, this.mode, this.batchSize, maxAwaitTime,
                 resumeStrategy, this.checkpointInterval, this.fullDocumentBeforeChange, this.fullDocument, this.pipeline,
-                this.documentClass);
+                this.documentClass));
     }
 
     public ChangeStream<T> resumeStrategy(ResumeStrategy resumeStrategy, long checkpointInterval) {
-        return new ChangeStream<T>(this.id, this.mode, this.batchSize, maxAwaitTime,
+        return withMeta(new ChangeStream<T>(this.id, this.mode, this.batchSize, maxAwaitTime,
                 resumeStrategy, checkpointInterval, this.fullDocumentBeforeChange, this.fullDocument, this.pipeline,
-                this.documentClass);
+                this.documentClass));
     }
 
     /**
@@ -294,21 +309,21 @@ public class ChangeStream<T> {
     }
 
     public ChangeStream<T> fullDocumentBeforeChange(FullDocumentBeforeChange fullDocumentBeforeChange) {
-        return new ChangeStream<T>(this.id, this.mode, this.batchSize, maxAwaitTime,
+        return withMeta(new ChangeStream<T>(this.id, this.mode, this.batchSize, maxAwaitTime,
                 this.resumeStrategy, this.checkpointInterval, fullDocumentBeforeChange, this.fullDocument, this.pipeline,
-                this.documentClass);
+                this.documentClass));
     }
 
     public ChangeStream<T> fullDocument(FullDocument fullDocument) {
-        return new ChangeStream<T>(this.id, this.mode, this.batchSize, maxAwaitTime,
+        return withMeta(new ChangeStream<T>(this.id, this.mode, this.batchSize, maxAwaitTime,
                 this.resumeStrategy, this.checkpointInterval, this.fullDocumentBeforeChange, fullDocument, this.pipeline,
-                this.documentClass);
+                this.documentClass));
     }
 
     public <NewT> ChangeStream<NewT> withClass(Class<NewT> clazz) {
-        return new ChangeStream<NewT>(this.id, this.mode, this.batchSize, this.maxAwaitTime,
+        return withMeta(new ChangeStream<NewT>(this.id, this.mode, this.batchSize, this.maxAwaitTime,
                 this.resumeStrategy, this.checkpointInterval, this.fullDocumentBeforeChange, this.fullDocument,
-                this.pipeline, clazz);
+                this.pipeline, clazz));
     }
 
 }

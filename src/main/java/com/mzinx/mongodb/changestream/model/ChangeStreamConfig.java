@@ -3,6 +3,7 @@ package com.mzinx.mongodb.changestream.model;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 import org.bson.Document;
@@ -75,6 +76,14 @@ public class ChangeStreamConfig {
     @Builder.Default
     private boolean enabled = true;
 
+    /**
+     * Free-form, listener-defined attributes for this change stream. The library
+     * does not interpret these; a listener bean can stash custom configuration
+     * here (for example, the name of an output aggregation pipeline to run) and
+     * read it back from its config at event time. Persisted as-is.
+     */
+    private Map<String, Object> attributes;
+
     /** Last modification time, maintained on save. */
     private Date updatedAt;
 
@@ -83,7 +92,7 @@ public class ChangeStreamConfig {
      */
     public ChangeStream<Document> toChangeStream() {
         List<Bson> stages = this.pipeline == null ? List.of() : new ArrayList<>(this.pipeline);
-        return new ChangeStream<>(this.id,
+        ChangeStream<Document> stream = new ChangeStream<>(this.id,
                 this.mode == null ? Mode.BROADCAST : this.mode,
                 this.batchSize,
                 this.maxAwaitTime,
@@ -93,6 +102,10 @@ public class ChangeStreamConfig {
                 this.fullDocument,
                 stages,
                 Document.class);
+        // Carry the config's attributes on the runtime stream so the listener
+        // receives them on every event without a per-event config lookup.
+        stream.setAttributes(this.attributes);
+        return stream;
     }
 
     /**
@@ -113,6 +126,7 @@ public class ChangeStreamConfig {
                 && this.fullDocumentBeforeChange == other.fullDocumentBeforeChange
                 && Objects.equals(this.pipeline, other.pipeline)
                 && Objects.equals(this.listener, other.listener)
+                && Objects.equals(this.attributes, other.attributes)
                 && this.enabled == other.enabled;
     }
 }
