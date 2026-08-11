@@ -4,6 +4,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 import org.bson.Document;
 import org.slf4j.Logger;
@@ -74,6 +75,14 @@ public class ChangeStreamManager {
     private final ChangeStreamRegistry changeStreamRegistry;
 
     private volatile boolean coordinationStreamStarted = false;
+
+    /**
+     * Stream ids already warned about for a missing listener bean, so the
+     * warning is logged once per stream instead of on every reconcile cycle. An
+     * id is cleared once its listener bean becomes available (or the config
+     * leaves this app), so a later fix re-arms the warning.
+     */
+    private final Set<String> missingListenerWarned = ConcurrentHashMap.newKeySet();
 
     ChangeStreamManager(ApplicationContext context, ChangeStreamProperties changeStreamProperties,
             ChangeStreamService<Document> changeStreamService, ChangeStreamConfigService changeStreamConfigService,
@@ -174,6 +183,21 @@ public class ChangeStreamManager {
             // config on the runtime is only set after a successful start, so a
             // half-started runtime is retried on the next refresh
             ChangeStreamConfig current = runtime == null ? null : runtime.getConfig();
+
+            // Role split: when a business app and a management console share this
+            // config collection, only run configs assigned to this app's role
+            // (and whose listener bean is present here). Others stay visible and
+            // manageable but run on the other side. If a running stream is no
+            // longer runnable here (its runOn changed), stop it locally.
+            if (!runnableHere(config)) {
+                if (current != null) {
+                    logger.info("Change stream config " + config.getId()
+                            + " is no longer runnable on this app (runOn=" + config.getRunOn()
+                            + ", manager=" + changeStreamProperties.isManager() + "), stopping locally");
+                    this.stop(config.getId());
+                }
+                continue;
+            }
 
             if (!config.isEnabled()) {
                 if (current != null) {
@@ -309,6 +333,46 @@ public class ChangeStreamManager {
                 .listener(runtime.getListener() == null ? null : runtime.getListener().getClass().getSimpleName())
                 .managedByConfig(runtime.getConfig() != null)
                 .build();
+    }
+
+    /**
+     * Whether this application instance should run the given config. A config
+     * runs here only when both hold:
+     * <ol>
+     *   <li>its {@link ChangeStreamConfig#getRunOn() runOn} matches this app's
+     *       role ({@code change-stream.manager}): {@code ANY} runs on either,
+     *       {@code MANAGER} only on the manager, {@code BUSINESS} only on the
+     *       non-manager; and</li>
+     *   <li>its {@link ChangeStreamConfig#getListener() listener} bean is present
+     *       in this app's context — so a config assigned to run here whose
+     *       listener bean is missing is skipped (with a warning) rather than
+     *       failing to start on every reconcile cycle.</li>
+     * </ol>
+     */
+    private boolean runnableHere(ChangeStreamConfig config) {
+        ChangeStreamConfig.RunOn runOn = config.getRunOn() == null
+                ? ChangeStreamConfig.RunOn.BUSINESS
+                : config.getRunOn();
+        boolean manager = this.changeStreamProperties.isManager();
+        boolean roleMatches = switch (runOn) {
+            case ANY -> true;
+            case MANAGER -> manager;
+            case BUSINESS -> !manager;
+        };
+        if (!roleMatches) {
+            this.missingListenerWarned.remove(config.getId());
+            return false;
+        }
+        String listener = config.getListener();
+        if (listener != null && !listener.isBlank() && !this.context.containsBean(listener)) {
+            if (this.missingListenerWarned.add(config.getId()))
+                logger.warn("Change stream config '" + config.getId() + "' is assigned to run here (runOn="
+                        + runOn + ", manager=" + manager + ") but its listener bean '" + listener
+                        + "' is not available in this application; skipping (will retry silently)");
+            return false;
+        }
+        this.missingListenerWarned.remove(config.getId());
+        return true;
     }
 
     @SuppressWarnings("unchecked")
