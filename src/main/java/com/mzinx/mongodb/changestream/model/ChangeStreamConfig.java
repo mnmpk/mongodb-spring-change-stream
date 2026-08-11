@@ -72,6 +72,35 @@ public class ChangeStreamConfig {
      */
     private String listener;
 
+    /**
+     * Which app runs this stream when a business app and a management app
+     * (mongostream) share one config collection ({@code _changeStreamConfigs}).
+     * An app runs a config only when {@link RunOn} matches its role
+     * ({@code change-stream.manager}) <em>and</em> its {@link #listener} bean is
+     * present locally. Non-matching configs stay visible to both apps (so the
+     * management console can list/create/start/stop/edit them) but run on exactly
+     * one side. Defaults to {@link RunOn#BUSINESS}.
+     */
+    @Builder.Default
+    private RunOn runOn = RunOn.BUSINESS;
+
+    /**
+     * Where a change stream config is allowed to run, relative to the app's role
+     * ({@code change-stream.manager}).
+     */
+    public enum RunOn {
+        /** Runs on the business app (the non-manager). The default for app streams. */
+        BUSINESS,
+        /** Runs on the management app (mongostream, {@code change-stream.manager=true}). */
+        MANAGER,
+        /**
+         * Runs wherever the listener bean is present, regardless of role — used
+         * by the libraries' own internal streams (e.g. discovery, which both apps
+         * run).
+         */
+        ANY
+    }
+
     /** Whether this change stream should be running. */
     @Builder.Default
     private boolean enabled = true;
@@ -127,6 +156,7 @@ public class ChangeStreamConfig {
                 && Objects.equals(this.pipeline, other.pipeline)
                 && Objects.equals(this.listener, other.listener)
                 && Objects.equals(this.attributes, other.attributes)
+                && this.runOn == other.runOn
                 && this.enabled == other.enabled;
     }
 }

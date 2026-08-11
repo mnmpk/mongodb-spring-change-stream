@@ -11,6 +11,15 @@ import lombok.Data;
 public class ChangeStreamProperties {
     private boolean enabled = true;
     private String hostname = System.getenv().getOrDefault("HOSTNAME", "localhost");
+    /**
+     * This app's role when a business app and a management console (mongostream)
+     * share one config collection. Set {@code true} on the management console so
+     * it runs configs marked {@code runOn=MANAGER} (and skips {@code BUSINESS}
+     * ones); leave {@code false} (default) on the business app, which runs
+     * {@code runOn=BUSINESS} configs. Streams marked {@code runOn=ANY} run on
+     * either, gated only by listener-bean presence.
+     */
+    private boolean manager = false;
     private long batchSize = 1000;
     private long maxAwaitTime = 800; // ms
     private long tokenMaxLifeTime = 86400000; // ms

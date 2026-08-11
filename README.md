@@ -11,6 +11,7 @@ A Spring Boot starter library that provides advanced MongoDB change stream capab
 - **Pipeline Support**: Apply aggregation pipelines to filter and transform change stream events
 - **Batch Processing**: Configurable batch sizes and await times for optimized performance
 - **TTL-based Cleanup**: Automatic cleanup of old resume tokens using MongoDB TTL indexes
+- **Multi-App Roles**: A shared config collection can be driven by a *business* app and a *management* console; each config's `runOn` decides which app executes it (see [Multi-App Deployments](#multi-app-deployments-runon))
 - **Spring Integration**: Seamless integration with Spring Boot and MongoDB
 
 ## Installation
@@ -45,6 +46,12 @@ change-stream.enabled=true
 
 # Hostname for instance identification (default: system HOSTNAME or localhost)
 change-stream.hostname=localhost
+
+# App role when a business app and a management console share one config
+# collection (default: false). Set true on the management console: it runs
+# configs marked runOn=MANAGER and skips runOn=BUSINESS ones. Leave false on the
+# business app. See "Multi-App Deployments" below.
+change-stream.manager=false
 
 # Batch size for change stream processing (default: 1000)
 change-stream.batchSize=1000
@@ -109,6 +116,7 @@ changeStreamConfigService.save(ChangeStreamConfig.builder()
     .pipeline(List.of(new Document("$match",
         new Document("operationType", new Document("$in", List.of("insert", "update"))))))
     .listener("orderListener")           // ChangeStreamListener bean name
+    .runOn(RunOn.BUSINESS)               // which app runs it (default BUSINESS)
     .enabled(true)
     .build());
 ```
@@ -126,6 +134,37 @@ public class OrderListener implements ChangeStreamListener<Document> {
 ```
 
 Disable a stream by saving the config with `enabled(false)`, or stop it permanently with `changeStreamConfigService.delete("orders-stream")`. Changes are picked up on the next refresh (`change-stream.configRefreshInterval`, default 30s).
+
+### Multi-App Deployments (runOn)
+
+Several apps can share one `_changeStreamConfigs` collection — typically a
+**business app** (the one with the listener beans and, where relevant, the
+WebSocket/messaging layer) plus a **management console** (e.g. `mongostream`)
+that lists, creates, edits, starts and stops streams centrally. To keep both
+apps from trying to run the same stream, each config carries a `runOn` value and
+each app declares its role via `change-stream.manager`:
+
+| `runOn`    | Runs on…                                                        |
+| ---------- | --------------------------------------------------------------- |
+| `BUSINESS` | the business app (`change-stream.manager=false`) — **default**  |
+| `MANAGER`  | the management console (`change-stream.manager=true`)           |
+| `ANY`      | wherever the config's listener bean is present, regardless of role |
+
+An app runs a config only when **both** hold:
+
+1. its `runOn` matches the app's role (`ANY` matches either), **and**
+2. its `listener` bean exists in that app's context.
+
+Configs that do not match are still fully visible and manageable everywhere
+(`findAll`, save, delete, enable/disable) — they simply execute on the other
+side. If a config is assigned to run on an app whose listener bean is missing,
+it is skipped with a one-time warning instead of failing every reconcile cycle.
+
+This is how the libraries scope their own internal streams: the message-queue
+and live-data streams are `runOn=BUSINESS` (their listeners and the WebSocket
+broker live in the business app), while discovery is `runOn=ANY` (every app runs
+its own instance watch). Runtime status for a stream that runs on the *other*
+app can be read from the shared coordination collection (`_changeStreams`).
 
 ### Programmatic Change Streams
 
